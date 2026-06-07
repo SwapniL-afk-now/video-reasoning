@@ -34,6 +34,11 @@ LVBench_full.csv
 # Benchmarks / temp data
 benchmarks/sonnet.txt
 
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
 # IDE
 .idea/
 .vscode/
