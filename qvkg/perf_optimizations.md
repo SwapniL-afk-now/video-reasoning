@@ -107,3 +107,17 @@ This requires extracting the per-frame scoring logic into a `_score_frame()` met
 | 4. Parallelize scoring | ~4-6 min | None | Medium (threading) |
 
 **Total:** 20 min → **~6-10 min** for a 100-min video. All changes are pure performance optimizations with zero effect on output quality.
+
+---
+
+## 5. Parallelize Whisper transcription with Step 1 (IMPLEMENTED)
+
+**Files:** `qvkg/qvkg/builder.py`
+
+**Problem:** Step 1 (frame sampling, ~10-20 min) and Step 2 (Whisper audio transcription, ~2-5 min) are both reading from the same video file but processing completely independent streams (video vs audio). They were running sequentially.
+
+**Fix:** Launch `_transcribe_background()` in a `ThreadPoolExecutor` before Step 1 starts. The background thread runs `self.whisper.transcribe()` and materializes the segment list. At Step 2, `whisper_future.result()` collects the already-completed result (or blocks briefly if Step 1 finished faster than Whisper).
+
+**Speedup:** ~2-5 min saved by overlapping Whisper with frame sampling.
+
+**Resume-safe:** If Step 1 was cached from a previous run (no background thread needed), Step 2 falls back to running Whisper synchronously.

@@ -6,7 +6,8 @@ import json
 import os
 import pickle
 import uuid
-from typing import Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Optional, Tuple
 
 from .causal import build_causal_request, parse_causal_edges
 from .character import CharacterMention, DescriptionBasedCharacterResolver
@@ -54,16 +55,41 @@ class VKGBuilder:
         self.siglip = siglip_encoder
         self.config = config
 
+    # ------------------------------------------------------------------
+    # Background transcription: called in a thread, overlaps with Step 1
+    # ------------------------------------------------------------------
+
+    def _transcribe_background(self, video_path: str) -> Optional[List]:
+        """Run Whisper transcription in a background thread.
+        
+        Returns list of segments or raises on failure.
+        """
+        try:
+            segments, _ = self.whisper.transcribe(
+                video_path, word_timestamps=False
+            )
+            return list(segments)
+        except Exception as e:
+            raise RuntimeError(f"Whisper transcription failed: {e}")
+
     def build(self, video_path: str, output_dir: str) -> VKGraph:
         os.makedirs(output_dir, exist_ok=True)
         graph = VKGraph()
         frame_store = FrameStore(output_dir)
 
+        # Pre-launch Whisper in background thread — overlaps with Step 1
+        whisper_future = None
+        step1_cached = _is_checkpoint(output_dir, "step1_sampled")
+        step2_cached = _is_checkpoint(output_dir, "step2_transcribed")
+        if not step2_cached and self.whisper is not None:
+            pool = ThreadPoolExecutor(max_workers=1)
+            whisper_future = pool.submit(self._transcribe_background, video_path)
+
         # ------------------------------------------------------------------
         # Step 1: Hierarchical frame sampling
         # ------------------------------------------------------------------
         sample = _read_pickle(output_dir, "sample.pkl")
-        if _is_checkpoint(output_dir, "step1_sampled") and sample is not None:
+        if step1_cached and sample is not None:
             print("Step 1: Hierarchical frame sampling [CACHED]")
             print(f"  Loaded {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
         else:
@@ -98,7 +124,7 @@ class VKGBuilder:
             print(f"  Saved {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
 
         # ------------------------------------------------------------------
-        # Step 2: Audio transcription
+        # Step 2: Audio transcription (collect background result if launched)
         # ------------------------------------------------------------------
         speech_nodes = _read_pickle(output_dir, "speech_nodes.pkl")
         if _is_checkpoint(output_dir, "step2_transcribed") and speech_nodes is not None:
@@ -107,18 +133,26 @@ class VKGBuilder:
         else:
             print("Step 2: Audio transcription (Whisper)...")
             speech_nodes = []
-            if self.whisper is not None:
-                try:
-                    segments, info = self.whisper.transcribe(
+            try:
+                if whisper_future is not None:
+                    segments = whisper_future.result()
+                elif self.whisper is not None:
+                    # Step 1 was cached — no background thread, run now
+                    segments, _ = self.whisper.transcribe(
                         video_path, word_timestamps=False
                     )
-                    speech_nodes = self._build_speech_nodes(list(segments))
+                    segments = list(segments)
+                else:
+                    segments = None
+
+                if segments:
+                    speech_nodes = self._build_speech_nodes(segments)
                     graph.add_nodes(speech_nodes)
                     _write_pickle(output_dir, "speech_nodes.pkl", speech_nodes)
                     _write_checkpoint(output_dir, "step2_transcribed")
                     print(f"  Transcribed {len(speech_nodes)} speech segments")
-                except Exception as e:
-                    print(f"  Whisper failed: {e} — skipping audio")
+            except Exception as e:
+                print(f"  Whisper failed: {e} — skipping audio")
 
         # ------------------------------------------------------------------
         # Step 3: Scene extraction
