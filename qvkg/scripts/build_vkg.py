@@ -41,6 +41,8 @@ def main():
     parser.add_argument("--no-whisper",     action="store_true")
     parser.add_argument("--tp",             type=int, default=1,
                         help="Tensor parallel size (GPUs)")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.65,
+                        help="vLLM GPU memory utilization (lower = more room for SigLIP)")
     parser.add_argument("--questions-csv",  default=None,
                         help="LVBench CSV — enables question-aware dense pre-sampling")
     parser.add_argument("--video-type",     default=None,
@@ -74,6 +76,7 @@ def main():
     llm = build_llm(
         model=args.model,
         tensor_parallel_size=args.tp,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         max_model_len=args.max_model_len,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,

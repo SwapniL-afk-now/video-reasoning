@@ -32,27 +32,28 @@ class DescriptionBasedCharacterResolver:
         mentions: List[CharacterMention],
         siglip_encoder,
         similarity_threshold: float = 0.80,
-    ) -> List[VKGNode]:
+    ) -> Optional[List[VKGNode]]:
         from sklearn.cluster import DBSCAN
 
         if not mentions:
-            return []
+            return None
 
         descriptions = [m.description for m in mentions]
 
         try:
             embeddings = siglip_encoder.encode_text(descriptions)
-            import faiss
-            faiss.normalize_L2(embeddings)
+        except Exception as e:
+            print(f"  Character resolution embedding failed: {e}")
+            return None
 
-            labels = DBSCAN(
-                eps=1.0 - similarity_threshold,
-                min_samples=1,
-                metric="cosine",
-            ).fit_predict(embeddings)
-        except Exception:
-            # Fallback: treat every mention as a unique character
-            labels = list(range(len(mentions)))
+        import faiss
+        faiss.normalize_L2(embeddings)
+
+        labels = DBSCAN(
+            eps=1.0 - similarity_threshold,
+            min_samples=1,
+            metric="cosine",
+        ).fit_predict(embeddings)
 
         clusters: dict = {}
         for mention, label in zip(mentions, labels):

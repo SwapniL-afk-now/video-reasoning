@@ -155,6 +155,10 @@ class VKGBuilder:
         if _is_checkpoint(output_dir, "step8_graph_built") and os.path.exists(checkpoint_graph):
             print("Steps 4-8: Node/edge creation [CACHED]")
             graph = VKGraph.load(checkpoint_graph)
+            # Re-add speech nodes that were added to graph in Step 2 but not persisted in graph checkpoint
+            for sn in speech_nodes:
+                if sn.id not in graph.nodes:
+                    graph.add_node(sn)
             print(f"  Graph has {len(graph.nodes)} nodes, "
                   f"{sum(len(v) for v in graph.edges.values())} edges")
         else:
@@ -184,13 +188,27 @@ class VKGBuilder:
             resolver = DescriptionBasedCharacterResolver()
             char_mentions = self._collect_character_mentions(graph, scene_data)
             characters = resolver.resolve(char_mentions, self.siglip)
-            for char in characters:
-                if char.id in graph.nodes:
-                    graph.nodes[char.id] = char
-                else:
-                    graph.add_node(char)
-            self._link_characters_to_events(graph, characters)
-            print(f"  Resolved {len(characters)} characters")
+            if characters is not None:
+                # Remove raw char_raw_* nodes — resolved chars replace them
+                raw_ids = [nid for nid in list(graph.nodes.keys())
+                           if nid.startswith("char_raw_")]
+                for rid in raw_ids:
+                    graph.nodes.pop(rid, None)
+                    graph.type_idx.get("CharacterNode", []).append(rid)
+                    graph.type_idx["CharacterNode"] = [
+                        nid for nid in graph.type_idx["CharacterNode"]
+                        if nid != rid
+                    ]
+                for char in characters:
+                    if char.id in graph.nodes:
+                        graph.nodes[char.id] = char
+                    else:
+                        graph.add_node(char)
+                self._link_characters_to_events(graph, characters)
+                print(f"  Resolved {len(characters)} characters, "
+                      f"removed {len(raw_ids)} raw mentions")
+            else:
+                print("  Character resolution failed — keeping raw character mentions")
 
             graph.save(checkpoint_graph)
             _write_checkpoint(output_dir, "step8_graph_built")

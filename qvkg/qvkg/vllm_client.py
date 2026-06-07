@@ -23,7 +23,7 @@ SCENE_EXTRACTION_SCHEMA = {
         },
         "scene_label": {
             "type": "string",
-            "description": "One concise label, e.g. 'kitchen cooking', 'street argument'"
+            "description": "Descriptive 2-6 word label capturing the key activity, e.g. 'hosts eating ramen outside 711', 'chef grilling wagyu beef', 'aerial view of coastal town'"
         },
         "objects": {
             "type": "array",
@@ -81,7 +81,7 @@ SCENE_EXTRACTION_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["description", "bbox_norm"],
+                "required": ["description", "bbox_norm", "emotion"],
                 "properties": {
                     "description": {
                         "type": "string",
@@ -193,8 +193,14 @@ SCENE_SYSTEM_PROMPT = (
     "Be precise about spatial positions (use normalized coordinates 0-1). "
     "For characters, provide distinctive appearance descriptions to enable "
     "cross-scene re-identification (e.g., 'young woman, black jacket, short brown "
-    "hair, glasses'). For state changes, note the approximate timestamp when the "
-    "transition occurs. Only report observations you can directly verify in the frames."
+    "hair, glasses'). Analyze and report each character's emotion.\n\n"
+    "IMPORTANT: For every person detected, include them in BOTH the 'objects' array "
+    "(with label like 'man', 'woman', 'chef') AND the 'characters' array "
+    "(with full description, emotion, and bbox). This ensures complete character tracking.\n\n"
+    "Report any visible text in the scene (signs, labels, prices, on-screen titles, "
+    "social media comments) in the 'ocr_text' array with the text content and location.\n\n"
+    "For state changes, note the approximate timestamp when the transition occurs. "
+    "Only report observations you can directly verify in the frames."
 )
 
 CAUSAL_SYSTEM_PROMPT = (
@@ -223,7 +229,7 @@ EPISODE_SYSTEM_PROMPT = (
 
 OFFLINE_SAMPLING = SamplingParams(
     temperature=0,
-    max_tokens=2048,
+    max_tokens=8192,
     structured_outputs=StructuredOutputsParams(json=SCENE_EXTRACTION_SCHEMA),
 )
 
@@ -344,7 +350,8 @@ class SigLIPEncoder:
         ).to(self.device)
 
         with torch.no_grad():
-            features = self.model.get_text_features(**inputs)
+            output = self.model.get_text_features(**inputs)
+            features = output.pooler_output if hasattr(output, "pooler_output") else output[1]
             features = features / features.norm(dim=-1, keepdim=True)
         return features.cpu().float().numpy()
 
@@ -354,7 +361,8 @@ class SigLIPEncoder:
 
         inputs = self.processor(images=image, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            features = self.model.get_image_features(**inputs)
+            output = self.model.get_image_features(**inputs)
+            features = output.pooler_output if hasattr(output, "pooler_output") else output[1]
             features = features / features.norm(dim=-1, keepdim=True)
         return features.cpu().float().numpy()[0]
 
@@ -364,6 +372,7 @@ class SigLIPEncoder:
 
         inputs = self.processor(images=images, return_tensors="pt").to(self.device)
         with torch.no_grad():
-            features = self.model.get_image_features(**inputs)
+            output = self.model.get_image_features(**inputs)
+            features = output.pooler_output if hasattr(output, "pooler_output") else output[1]
             features = features / features.norm(dim=-1, keepdim=True)
         return features.cpu().float().numpy()

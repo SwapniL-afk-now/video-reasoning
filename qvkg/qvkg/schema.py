@@ -156,9 +156,10 @@ class Episode:
 
 @dataclass
 class SampleResult:
-    keyframes:  List[FrameInfo]
-    scenes:     List[Scene]
-    episodes:   List[Episode]
+    keyframes:         List[FrameInfo]
+    scenes:            List[Scene]
+    episodes:          List[Episode]
+    siglip_embeddings: Optional[np.ndarray] = None
 
 
 @dataclass

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 """Hierarchical frame sampler: 4-level importance-scored selection."""
 
+import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Tuple
 
 import av
@@ -29,8 +31,10 @@ class HierarchicalSampler:
             return SampleResult([], [], [])
 
         print(f"  Extracted {len(coarse)} coarse frames at ~1fps")
-        scores = self._score_all(coarse, audio_rms)
-        boundaries = self._detect_boundaries(coarse, scores, hard_thresh, soft_thresh)
+        siglip_embs = self._siglip_batch(coarse)
+        scores = self._score_all(coarse, audio_rms, siglip_embs)
+        boundaries = self._detect_boundaries(coarse, scores, hard_thresh, soft_thresh,
+                                              embeddings=siglip_embs)
         print(f"  Detected {len(boundaries)} scenes")
 
         keyframes: List[FrameInfo] = []
@@ -46,7 +50,10 @@ class HierarchicalSampler:
 
         keyframes = self._rebalance(keyframes, scores, coarse, budget)
         print(f"  Selected {len(keyframes)} keyframes (budget={budget})")
-        return SampleResult(keyframes=keyframes, scenes=boundaries, episodes=[])
+        return SampleResult(
+            keyframes=keyframes, scenes=boundaries, episodes=[],
+            siglip_embeddings=siglip_embs,
+        )
 
     # ------------------------------------------------------------------
     # Frame extraction
@@ -123,20 +130,21 @@ class HierarchicalSampler:
         fps = float(stream.average_rate or 25)
         duration = float(stream.duration * stream.time_base) if stream.duration else 0
 
-        frame_interval = int(fps / target_fps)
-        frame_idx = 0
-
         # Extract audio RMS per second
         audio_rms = self._extract_audio_rms(video_path)
 
-        for packet in container.demux(stream):
-            for av_frame in packet.decode():
-                if frame_idx % max(1, frame_interval) == 0:
-                    ts = float(av_frame.pts * stream.time_base) if av_frame.pts else frame_idx / fps
-                    img = av_frame.to_image().convert("RGB")
-                    fid = f"f_{len(frames):06d}"
-                    frames.append(FrameInfo(id=fid, timestamp=ts, image=img))
-                frame_idx += 1
+        step_sec = 1.0 / target_fps
+        time_base = stream.time_base
+        target_ts = 0.0
+        while target_ts <= duration:
+            pts = int(target_ts / float(time_base))
+            container.seek(pts, stream=stream)
+            for av_frame in container.decode(video=0):
+                img = av_frame.to_image().convert("RGB")
+                fid = f"f_{len(frames):06d}"
+                frames.append(FrameInfo(id=fid, timestamp=target_ts, image=img))
+                break
+            target_ts += step_sec
 
         container.close()
         return frames, fps, audio_rms
@@ -175,34 +183,47 @@ class HierarchicalSampler:
     # Scoring
     # ------------------------------------------------------------------
 
+    def _score_frame(self, i: int, frames: List[FrameInfo],
+                     embeddings: Optional[np.ndarray],
+                     audio_rms: np.ndarray) -> float:
+        prev_img = np.array(frames[i - 1].image) if i > 0 else np.array(frames[i].image)
+        curr_img = np.array(frames[i].image)
+
+        hist_d = self._histogram_diff(curr_img, prev_img)
+        sem_d = (1.0 - float(np.dot(embeddings[i], embeddings[i - 1]))) if i > 0 and embeddings is not None else 0.0
+        motion = self._optical_flow_mag(prev_img, curr_img)
+        ts = int(frames[i].timestamp)
+        audio_e = float(audio_rms[min(ts, len(audio_rms) - 1)])
+
+        return 0.30 * hist_d + 0.30 * sem_d + 0.20 * motion + 0.20 * audio_e
+
     def _score_all(
-        self, frames: List[FrameInfo], audio_rms: np.ndarray
+        self, frames: List[FrameInfo], audio_rms: np.ndarray,
+        embeddings: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         n = len(frames)
         scores = np.zeros(n)
-        # Batch SigLIP embeddings if available
-        embeddings = self._siglip_batch(frames)
-
-        for i in range(n):
-            prev_img = np.array(frames[i - 1].image) if i > 0 else np.array(frames[i].image)
-            curr_img = np.array(frames[i].image)
-            next_img = np.array(frames[i + 1].image) if i < n - 1 else curr_img
-
-            hist_d = self._histogram_diff(curr_img, prev_img)
-            sem_d = (1.0 - float(np.dot(embeddings[i], embeddings[i - 1])))  if i > 0 and embeddings is not None else 0.0
-            motion = self._optical_flow_mag(prev_img, curr_img)
-            ts = int(frames[i].timestamp)
-            audio_e = float(audio_rms[min(ts, len(audio_rms) - 1)])
-
-            scores[i] = (0.30 * hist_d +
-                         0.30 * sem_d +
-                         0.20 * motion +
-                         0.20 * audio_e)
-
-        # Normalise to [0,1]
+        n_workers = min(os.cpu_count() or 4, n)
+        chunk_size = max(1, n // n_workers)
+        chunks = [range(i, min(i + chunk_size, n)) for i in range(0, n, chunk_size)]
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = []
+            for c in chunks:
+                futures.append(pool.submit(
+                    self._score_chunk, c, frames, embeddings, audio_rms
+                ))
+            for f in futures:
+                indices, chunk_scores = f.result()
+                scores[list(indices)] = chunk_scores
         if scores.max() > 0:
             scores = scores / scores.max()
         return scores
+
+    def _score_chunk(self, idx_range, frames, embeddings, audio_rms):
+        chunk_scores = np.zeros(len(idx_range))
+        for local_i, global_i in enumerate(idx_range):
+            chunk_scores[local_i] = self._score_frame(global_i, frames, embeddings, audio_rms)
+        return idx_range, chunk_scores
 
     def _siglip_batch(self, frames: List[FrameInfo]) -> Optional[np.ndarray]:
         if self.siglip is None:
@@ -248,11 +269,13 @@ class HierarchicalSampler:
         scores: np.ndarray,
     hard_thresh: float = 0.75,
     soft_thresh: float = 0.5,
+    embeddings: Optional[np.ndarray] = None,
     ) -> List[Scene]:
         if len(frames) == 0:
             return []
 
-        embeddings = self._siglip_batch(frames)
+        if embeddings is None:
+            embeddings = self._siglip_batch(frames)
         scene_start = 0
         boundaries: List[Scene] = []
 
