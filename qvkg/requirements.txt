@@ -1,0 +1,22 @@
+# Core ML — already installed on this machine
+vllm==0.21.0
+torch==2.11.0+cu130
+transformers==5.8.1
+opencv-python-headless
+networkx
+numpy
+pydantic
+tqdm
+
+# Missing — installed separately
+faster-whisper
+faiss-gpu-cu12
+h5py
+scipy
+scikit-learn
+soundfile
+av
+sortedcontainers
+einops
+pyyaml
+pytest
