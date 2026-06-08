@@ -16,6 +16,10 @@ def build_causal_request(
     frame_store: FrameStore,
 ) -> dict:
     events = graph.get_events_in_episode(episode)
+    # Cap events to avoid exceeding the model's context window on long episodes.
+    MAX_EVENTS = 300
+    if len(events) > MAX_EVENTS:
+        events = events[:MAX_EVENTS]
     event_timeline = "\n".join(
         f"  [{e.t_start:.1f}s] [{e.node_type}] {e.label}"
         for e in events

@@ -505,46 +505,73 @@ PLANNER_SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 
 PLANNER_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=512,
     structured_outputs=StructuredOutputsParams(json=PLANNER_SCHEMA),
 )
 
 VIDEO_TYPE_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=0.7,
+    top_p=0.8,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=512,
     structured_outputs=StructuredOutputsParams(json=VIDEO_TYPE_SCHEMA),
 )
 
 ENTITY_RESOLUTION_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=32768,
     structured_outputs=StructuredOutputsParams(json=ENTITY_RESOLUTION_SCHEMA),
 )
 
 OFFLINE_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=0.7,
+    top_p=0.8,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=8192,
     structured_outputs=StructuredOutputsParams(json=SCENE_EXTRACTION_SCHEMA),
 )
 
 CAUSAL_SAMPLING = SamplingParams(
-    temperature=0.1,
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=1024,
     structured_outputs=StructuredOutputsParams(json=CAUSAL_SCHEMA),
 )
 
 QA_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=32768,
 )
 
 # Multiple-choice: model reasons freely inside <think>…</think> then answers.
 # max_tokens covers both the thinking trace and the final answer letter.
 MCQ_REASONING_SAMPLING = SamplingParams(
-    temperature=0,
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
     max_tokens=8192,
-    # No structured_outputs — let the model reason freely with thinking enabled
 )
 
 MCQ_SYSTEM_PROMPT = (

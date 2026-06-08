@@ -309,27 +309,30 @@ class VKGBuilder:
             print("Step 10: Causal chain inference (Qwen batch)...")
             episodes = graph.get_episodes()
             if episodes:
-                causal_requests = [
-                    build_causal_request(
-                        _episode_node_to_episode(ep, graph),
-                        graph, frame_store
+                try:
+                    causal_requests = [
+                        build_causal_request(
+                            _episode_node_to_episode(ep, graph),
+                            graph, frame_store
+                        )
+                        for ep in episodes
+                    ]
+                    causal_outputs = self.llm.chat(
+                        messages=[r["messages"] for r in causal_requests],
+                        sampling_params=CAUSAL_SAMPLING,
+                        use_tqdm=True,
                     )
-                    for ep in episodes
-                ]
-                causal_outputs = self.llm.chat(
-                    messages=[r["messages"] for r in causal_requests],
-                    sampling_params=CAUSAL_SAMPLING,
-                    use_tqdm=True,
-                )
-                total_causal = 0
-                for req, ep_node, out in zip(causal_requests, episodes, causal_outputs):
-                    ep_obj = _episode_node_to_episode(ep_node, graph)
-                    edges = parse_causal_edges(
-                        out.outputs[0].text, graph, ep_obj
-                    )
-                    graph.add_edges(edges)
-                    total_causal += len(edges)
-                print(f"  Added {total_causal} causal edges")
+                    total_causal = 0
+                    for req, ep_node, out in zip(causal_requests, episodes, causal_outputs):
+                        ep_obj = _episode_node_to_episode(ep_node, graph)
+                        edges = parse_causal_edges(
+                            out.outputs[0].text, graph, ep_obj
+                        )
+                        graph.add_edges(edges)
+                        total_causal += len(edges)
+                    print(f"  Added {total_causal} causal edges")
+                except Exception as e:
+                    print(f"  Step 10 skipped ({type(e).__name__}: {e})")
             graph.save(checkpoint_graph)
             _write_checkpoint(output_dir, "step10_causal")
 
