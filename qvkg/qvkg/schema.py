@@ -373,10 +373,23 @@ class VKGraph:
         self, desc: str, candidates: List[VKGNode]
     ) -> Optional[VKGNode]:
         desc_l = desc.lower()
+        # Pass 1: substring containment (require label >= 4 chars to avoid single-letter OCR hits)
         for n in candidates:
-            if desc_l in n.label.lower() or n.label.lower() in desc_l:
+            if len(n.label) >= 4 and (desc_l in n.label.lower() or n.label.lower() in desc_l):
                 return n
-        return None
+        # Pass 2: token Jaccard >= 0.25
+        desc_words = {w for w in desc_l.split() if len(w) > 3}
+        if not desc_words:
+            return None
+        best_node, best_score = None, 0.24
+        for n in candidates:
+            node_words = {w for w in n.label.lower().split() if len(w) > 3}
+            if not node_words:
+                continue
+            score = len(desc_words & node_words) / len(desc_words | node_words)
+            if score > best_score:
+                best_score, best_node = score, n
+        return best_node
 
     def find_entity_in_scene(
         self, entity_label: str, scene_id: str

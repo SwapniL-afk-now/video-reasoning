@@ -103,6 +103,16 @@ def main():
                         help="Minimum pixels per image (default 256*28*28)")
     parser.add_argument("--max-pixels",    type=int, default=1003520,
                         help="Maximum pixels per image (default 1280*28*28)")
+    parser.add_argument("--agent",         action="store_true", default=False,
+                        help="Use agentic graph search (VLM drives retrieval) instead of one-shot")
+    parser.add_argument("--two-stage",     action="store_true", default=False,
+                        help="Use two-stage QA: planner call → context assembly → answerer call")
+    parser.add_argument("--react",         action="store_true", default=False,
+                        help="Use ReAct agent (Thought/Action/Observation loop, plain-text actions)")
+    parser.add_argument("--max-turns",     type=int, default=6,
+                        help="Max tool-call turns per question in agent/react mode (default 6)")
+    parser.add_argument("--debug-dir",     type=str, default=None,
+                        help="Directory to write per-question debug logs and frame images")
     args = parser.parse_args()
 
     # Load models once
@@ -126,7 +136,10 @@ def main():
 
     from qvkg.faiss_index import load_faiss_index
     from qvkg.frame_store import FrameStore
-    from qvkg.query.qa import answer_question
+    from qvkg.query.qa import batch_answer_questions
+    from qvkg.query.agent import agent_answer_question
+    from qvkg.query.two_stage import two_stage_answer_question, batch_two_stage_answer_questions
+    from qvkg.query.react_agent import react_answer_question
     from qvkg.schema import VKGraph
 
     total_done = 0
@@ -143,49 +156,144 @@ def main():
                 print(f"  [SKIP] No VKG for {video_filename}")
                 continue
 
-            print(f"\nVideo: {video_filename} ({len(questions)} questions)")
+            # Filter to unanswered questions
+            pending = []
+            for q in questions:
+                if q["uid"] in answered_uids:
+                    continue
+                if args.limit and total_done + len(pending) >= args.limit:
+                    break
+                pending.append(q)
 
-            # Load VKG once per video
+            if not pending:
+                print(f"\nVideo: {video_filename} — all questions already answered, skipping")
+                continue
+
+            print(f"\nVideo: {video_filename} ({len(pending)} pending / {len(questions)} total)")
+
             graph       = VKGraph.load(vkg_path)
             faiss_index = load_faiss_index(index_path)
             frame_store = FrameStore(os.path.join(args.vkg_dir, video_id), mode="r")
             video_type  = questions[0].get("type", "")
 
             if faiss_index is None:
-                print(f"  [WARN] No FAISS index for {video_filename} — FAISS path disabled")
+                print(f"  [WARN] No FAISS index for {video_filename}")
 
-            for q in questions:
-                uid = q["uid"]
-                if uid in answered_uids:
-                    continue
-                if args.limit and total_done >= args.limit:
-                    break
+            vp = video_path if os.path.exists(video_path) else None
 
-                question_text = q["question"]
-                gt_answer     = q["answer"].strip().upper()
-                time_ref      = q.get("time_reference", "").strip() or None
-                qt            = parse_qt(q.get("question_type", ""))
-
+            if args.react:
+                # ReAct: Thought/Action/Observation loop with plain-text actions (serial)
+                print(f"  ReAct mode: {len(pending)} questions (max {args.max_turns} turns each)...")
+                results = []
+                for q in pending:
+                    qt       = parse_qt(q.get("question_type", ""))
+                    time_ref = q.get("time_reference", "").strip() or None
+                    try:
+                        result = react_answer_question(
+                            question       = q["question"],
+                            graph          = graph,
+                            faiss_index    = faiss_index,
+                            llm            = llm,
+                            siglip_encoder = siglip,
+                            video_path     = vp,
+                            question_type  = qt,
+                            time_reference = time_ref,
+                            mcq            = True,
+                            max_turns      = args.max_turns,
+                        )
+                    except Exception as e:
+                        print(f"    [ERR] uid={q['uid']}: {e}")
+                        result = None
+                    results.append(result)
+            elif args.two_stage:
+                # Two-stage batched: 1 planner call + 1 answerer call for all questions
+                print(f"  Two-stage (batch) mode: {len(pending)} questions...")
+                batch_input = [
+                    {
+                        "question":       q["question"],
+                        "question_type":  parse_qt(q.get("question_type", "")),
+                        "time_reference": q.get("time_reference", "").strip() or None,
+                        "uid":            q["uid"],
+                    }
+                    for q in pending
+                ]
                 try:
-                    result = answer_question(
-                        question       = question_text,
+                    results = batch_two_stage_answer_questions(
+                        questions      = batch_input,
+                        graph          = graph,
+                        faiss_index    = faiss_index,
+                        llm            = llm,
+                        siglip_encoder = siglip,
+                        video_path     = vp,
+                        mcq            = True,
+                        debug_dir      = args.debug_dir,
+                    )
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    print(f"  [ERR] batch failed: {e}")
+                    results = [None] * len(pending)
+            elif args.agent:
+                # Agentic mode: VLM drives graph traversal per question (serial)
+                print(f"  Agent mode: {len(pending)} questions (max {args.max_turns} turns each)...")
+                results = []
+                for q in pending:
+                    qt       = parse_qt(q.get("question_type", ""))
+                    time_ref = q.get("time_reference", "").strip() or None
+                    try:
+                        result = agent_answer_question(
+                            question       = q["question"],
+                            graph          = graph,
+                            faiss_index    = faiss_index,
+                            llm            = llm,
+                            siglip_encoder = siglip,
+                            video_path     = vp,
+                            question_type  = qt,
+                            time_reference = time_ref,
+                            mcq            = True,
+                            max_turns      = args.max_turns,
+                        )
+                    except Exception as e:
+                        print(f"    [ERR] uid={q['uid']}: {e}")
+                        result = None
+                    results.append(result)
+            else:
+                # One-shot batch mode: all questions in a single vLLM call
+                batch_input = [
+                    {
+                        "question":       q["question"],
+                        "question_type":  parse_qt(q.get("question_type", "")),
+                        "time_reference": q.get("time_reference", "").strip() or None,
+                    }
+                    for q in pending
+                ]
+                print(f"  Sending {len(pending)} questions to vLLM in one batch...")
+                try:
+                    results = batch_answer_questions(
+                        questions      = batch_input,
                         graph          = graph,
                         faiss_index    = faiss_index,
                         frame_store    = frame_store,
                         llm            = llm,
                         siglip_encoder = siglip,
-                        question_type  = qt,
-                        time_reference = time_ref,
-                        video_path     = video_path if os.path.exists(video_path) else None,
+                        video_path     = vp,
                         video_type     = video_type,
                         mcq            = True,
                     )
-                    pred = result.answer.strip().upper()
-                    correct = pred == gt_answer
                 except Exception as e:
-                    pred    = "ERROR"
-                    correct = False
-                    print(f"    [ERR] uid={uid}: {e}")
+                    print(f"  [ERR] batch failed: {e}")
+                    results = [None] * len(pending)
+
+            for q, result in zip(pending, results):
+                uid       = q["uid"]
+                gt_answer = q["answer"].strip().upper()
+                qt        = parse_qt(q.get("question_type", ""))
+                time_ref  = q.get("time_reference", "").strip() or None
+
+                if result is None:
+                    pred, correct = "ERROR", False
+                else:
+                    pred    = result.answer.strip().upper()
+                    correct = pred == gt_answer
 
                 record = {
                     "uid":            uid,
@@ -201,12 +309,12 @@ def main():
                 out_f.flush()
                 all_results.append(record)
                 answered_uids.add(uid)
-                total_done += 1
 
                 status = "✓" if correct else "✗"
                 print(f"  {status} uid={uid} pred={pred} gt={gt_answer} "
                       f"[{', '.join(qt)}] t={time_ref}")
 
+            total_done += len(pending)
             if args.limit and total_done >= args.limit:
                 break
 

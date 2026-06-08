@@ -10,7 +10,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 from .causal import build_causal_request, parse_causal_edges
-from .character import CharacterMention, DescriptionBasedCharacterResolver
+from .character import (
+    CharacterMention, DescriptionBasedCharacterResolver, LLMEntityResolver,
+)
 from .episode import segment_episodes
 from .extraction import SceneData, run_scene_extraction
 from .faiss_index import build_faiss_index, build_semantic_edges_faiss
@@ -19,7 +21,7 @@ from .sampler import HierarchicalSampler
 from .schema import (
     Episode, FrameInfo, Scene, VKGEdge, VKGNode, VKGraph,
 )
-from .vllm_client import CAUSAL_SAMPLING
+from .vllm_client import CAUSAL_SAMPLING, VIDEO_TYPE_SAMPLING, VIDEO_TYPE_SYSTEM_PROMPT
 
 
 def _checkpoint_path(output_dir: str, step: str) -> str:
@@ -76,6 +78,27 @@ class VKGBuilder:
         os.makedirs(output_dir, exist_ok=True)
         graph = VKGraph()
         frame_store = FrameStore(output_dir)
+
+        # ------------------------------------------------------------------
+        # Step 0: Video type detection (skip if already set in config)
+        # ------------------------------------------------------------------
+        if "video_type" not in self.config or not self.config["video_type"]:
+            if _is_checkpoint(output_dir, "step0_videotype"):
+                vt_meta = _read_pickle(output_dir, "video_type.pkl")
+                if vt_meta:
+                    self.config.update(vt_meta)
+                    print(f"Step 0: Video type detection [CACHED] → {self.config.get('video_type')}")
+            else:
+                print("Step 0: Video type detection...")
+                vt_meta = self._detect_video_type(video_path)
+                self.config.update(vt_meta)
+                _write_pickle(output_dir, "video_type.pkl", vt_meta)
+                _write_checkpoint(output_dir, "step0_videotype")
+                print(f"  Detected: {vt_meta.get('video_type')} "
+                      f"(narrator={vt_meta.get('has_narrator_voiceover')}, "
+                      f"multi-speaker={vt_meta.get('has_multiple_speakers')})")
+        else:
+            print(f"Step 0: Video type set by config → {self.config['video_type']}")
 
         # Pre-launch Whisper in background thread — overlaps with Step 1
         whisper_future = None
@@ -162,7 +185,11 @@ class VKGBuilder:
             print(f"Step 3: Scene extraction [CACHED] ({len(scene_data)} scenes)")
         else:
             print("Step 3: Scene extraction (Qwen batch)...")
-            scene_data = run_scene_extraction(sample.scenes, frame_store, self.llm)
+            scene_data = run_scene_extraction(
+                sample.scenes, frame_store, self.llm,
+                video_type=self.config.get("video_type", ""),
+                has_narrator=self.config.get("has_narrator_voiceover", False),
+            )
             _write_pickle(output_dir, "scene_data.pkl", scene_data)
             _write_checkpoint(output_dir, "step3_extracted")
             print(f"  Extracted data for {len(scene_data)} scenes")
@@ -216,21 +243,29 @@ class VKGBuilder:
             # Step 7: Cross-modal edges
             print("Step 7: Cross-modal edges...")
             self._build_crossmodal_edges(graph)
+            self._build_speaker_edges_from_extraction(graph, scene_data)
+            self._build_ocr_semantic_edges(graph, scene_data)
 
-            # Step 8: Character resolution
+            # Step 8: Character resolution (LLM-native, DBSCAN fallback)
             print("Step 8: Character resolution...")
-            resolver = DescriptionBasedCharacterResolver()
             char_mentions = self._collect_character_mentions(graph, scene_data)
-            characters = resolver.resolve(char_mentions, self.siglip)
+            llm_resolver = LLMEntityResolver()
+            characters = llm_resolver.resolve(
+                char_mentions, self.llm,
+                video_type=self.config.get("video_type", ""),
+            )
+            if characters is None:
+                print("  LLM resolution failed — falling back to DBSCAN")
+                fallback = DescriptionBasedCharacterResolver()
+                characters = fallback.resolve(char_mentions, self.siglip)
             if characters is not None:
                 # Remove raw char_raw_* nodes — resolved chars replace them
                 raw_ids = [nid for nid in list(graph.nodes.keys())
                            if nid.startswith("char_raw_")]
                 for rid in raw_ids:
                     graph.nodes.pop(rid, None)
-                    graph.type_idx.get("CharacterNode", []).append(rid)
                     graph.type_idx["CharacterNode"] = [
-                        nid for nid in graph.type_idx["CharacterNode"]
+                        nid for nid in graph.type_idx.get("CharacterNode", [])
                         if nid != rid
                     ]
                 for char in characters:
@@ -239,6 +274,9 @@ class VKGBuilder:
                     else:
                         graph.add_node(char)
                 self._link_characters_to_events(graph, characters)
+                self._build_same_entity_edges(graph, characters)
+                # Re-run speaker edges now that resolved chars are in graph
+                self._build_speaker_edges_from_extraction(graph, scene_data)
                 print(f"  Resolved {len(characters)} characters, "
                       f"removed {len(raw_ids)} raw mentions")
             else:
@@ -304,7 +342,7 @@ class VKGBuilder:
             n_sem = build_semantic_edges_faiss(
                 graph, faiss_index,
                 threshold=self.config.get("semantic_threshold", 0.78),
-                k_neighbors=10,
+                k_neighbors=self.config.get("semantic_k_neighbors", 10),
             )
             print(f"  Added {n_sem} semantic SIMILAR_TO edges")
             graph.save(checkpoint_graph)
@@ -377,11 +415,16 @@ class VKGBuilder:
         graph.add_node(video_node)
 
         # Episode nodes (from sample — populated by episode segmentation in builder.build)
+        import re as _re
         for ep in sample.episodes:
+            label = ep.label
+            if _re.match(r'^Episode \d+$', label) and ep.summary:
+                role_str = ep.narrative_role.replace('_', ' ').title()
+                label = f"{role_str}: {ep.summary[:50]}"
             ep_node = VKGNode(
                 id=ep.id,
                 node_type="EpisodeNode",
-                label=ep.label,
+                label=label,
                 level=2,
                 t_start=ep.t_start,
                 t_end=ep.t_end,
@@ -404,7 +447,11 @@ class VKGBuilder:
                 t_start=scene.t_start,
                 t_end=scene.t_end,
                 keyframe_id=scene.keyframes[0].id if scene.keyframes else None,
-                metadata={"mood": sd.scene_mood},
+                metadata={
+                    "mood":               sd.scene_mood,
+                    "narrative_function": sd.narrative_function,
+                    "current_speaker":    sd.current_speaker,
+                },
             )
             graph.add_node(scene_node)
 
@@ -617,10 +664,29 @@ class VKGBuilder:
                         metadata={"source": "qwen3vl", "scene": scene_id},
                     ))
 
+    @staticmethod
+    def _bbox_iou(a: List[float], b: List[float]) -> float:
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        if inter == 0.0:
+            return 0.0
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        denom = area_a + area_b - inter
+        return inter / denom if denom > 0 else 0.0
+
     def _build_crossmodal_edges(self, graph: VKGraph) -> None:
         speech_nodes = graph.get_nodes_by_type("SpeechNode")
         ocr_nodes    = graph.get_nodes_by_type("OCRNode")
         scene_nodes  = graph.get_nodes_by_type("SceneNode")
+        obj_nodes    = graph.get_nodes_by_type("ObjectNode")
+
+        # Build scene_id → list of ObjectNodes for fast lookup
+        scene_objs: Dict[str, List[VKGNode]] = {}
+        for obj in obj_nodes:
+            if obj.parent_id:
+                scene_objs.setdefault(obj.parent_id, []).append(obj)
 
         # Speech → concurrent scene (DESCRIBES)
         for speech in speech_nodes:
@@ -633,8 +699,9 @@ class VKGBuilder:
                     ))
                     break
 
-        # OCR → concurrent scene (LABELS)
+        # OCR → concurrent scene (LABELS) + overlapping ObjectNode (LABELS)
         for ocr in ocr_nodes:
+            matched_scene_id = None
             for scene in scene_nodes:
                 if scene.t_start <= ocr.t_start <= scene.t_end:
                     graph.add_edge(VKGEdge(
@@ -642,7 +709,16 @@ class VKGBuilder:
                         relation_type="LABELS", weight=0.9, confidence=0.9,
                         metadata={"source": "temporal_overlap"},
                     ))
+                    matched_scene_id = scene.id
                     break
+            if ocr.bbox and matched_scene_id:
+                for obj in scene_objs.get(matched_scene_id, []):
+                    if obj.bbox and self._bbox_iou(ocr.bbox, obj.bbox) >= 0.10:
+                        graph.add_edge(VKGEdge(
+                            source_id=ocr.id, target_id=obj.id,
+                            relation_type="LABELS", weight=0.85, confidence=0.85,
+                            metadata={"source": "bbox_overlap"},
+                        ))
 
     # ------------------------------------------------------------------
     # Step 8 helpers
@@ -676,20 +752,281 @@ class VKGBuilder:
             appearances = char.metadata.get("appearances", [])
             for app in appearances:
                 scene_id = app.get("scene_id", "")
+                if not scene_id:
+                    continue
                 # Link character → action nodes in same scene
                 for act in graph.get_nodes_by_type("ActionNode"):
                     if act.parent_id == scene_id:
                         actor_desc = act.metadata.get("actor", "").lower()
+                        confidence = 0.8
+                        relation_type = "PERFORMS"
+
                         if actor_desc and any(
                             w in char.canonical_description.lower()
                             for w in actor_desc.split()
                             if len(w) > 3
                         ):
-                            graph.add_edge(VKGEdge(
-                                source_id=char.id, target_id=act.id,
-                                relation_type="PERFORMS",
-                                weight=0.8, confidence=0.8,
-                            ))
+                            confidence = 0.9  # Higher confidence for text-matched
+                        else:
+                            relation_type = "CO_OCCURS_WITH"
+
+                        graph.add_edge(VKGEdge(
+                            source_id=char.id, target_id=act.id,
+                            relation_type=relation_type,
+                            weight=confidence, confidence=confidence,
+                        ))
+
+    def _build_same_entity_edges(
+        self, graph: VKGraph, characters: List[VKGNode]
+    ) -> None:
+        by_entity: Dict[str, List[VKGNode]] = {}
+        for ch in characters:
+            if ch.entity_id:
+                by_entity.setdefault(ch.entity_id, []).append(ch)
+        for group in by_entity.values():
+            for i, a in enumerate(group):
+                for b in group[i + 1:]:
+                    graph.add_edge(VKGEdge(
+                        source_id=a.id, target_id=b.id,
+                        relation_type="SAME_ENTITY", weight=1.0, confidence=1.0,
+                        metadata={"source": "character_resolution"},
+                    ))
+
+    def _detect_video_type(self, video_path: str) -> dict:
+        """Sample 12 frames from the first 3 minutes and ask the VLM to classify."""
+        import cv2
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        max_frame = min(total_frames - 1, int(fps * 180))  # first 3 min
+        n_frames = 8  # keep well under the 10-image-per-prompt limit
+        sample_frames = [int(max_frame * i / (n_frames - 1)) for i in range(n_frames)]
+
+        import base64
+        content = []
+        for fidx in sample_frames:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, fidx)
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            ok2, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if not ok2:
+                continue
+            b64 = base64.b64encode(buf.tobytes()).decode()
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
+            })
+            content.append({
+                "type": "text",
+                "text": f"[t≈{fidx/fps:.0f}s]",
+            })
+        cap.release()
+
+        content.append({
+            "type": "text",
+            "text": "Classify this video type based on these frames. Return JSON only.",
+        })
+
+        try:
+            outputs = self.llm.chat(
+                messages=[[
+                    {"role": "system", "content": VIDEO_TYPE_SYSTEM_PROMPT},
+                    {"role": "user",   "content": content},
+                ]],
+                sampling_params=VIDEO_TYPE_SAMPLING,
+            )
+            result = json.loads(outputs[0].outputs[0].text)
+            return {
+                "video_type":             result.get("video_type", "other"),
+                "has_narrator_voiceover": bool(result.get("has_narrator_voiceover", False)),
+                "has_multiple_speakers":  bool(result.get("has_multiple_speakers", True)),
+                "dominant_language":      result.get("dominant_language", "en"),
+                "key_characteristics":    result.get("key_characteristics", []),
+            }
+        except Exception as e:
+            print(f"  Video type detection failed: {e} — defaulting to 'other'")
+            return {
+                "video_type": "other",
+                "has_narrator_voiceover": False,
+                "has_multiple_speakers": True,
+                "dominant_language": "en",
+                "key_characteristics": [],
+            }
+
+    def _build_speaker_edges_from_extraction(
+        self,
+        graph: VKGraph,
+        scene_data: Dict[str, SceneData],
+    ) -> None:
+        """Build SPOKEN_BY edges using the LLM-extracted current_speaker per scene."""
+        for scene_id, sd in scene_data.items():
+            if not sd.current_speaker or sd.current_speaker == "unknown":
+                continue
+
+            speech_in_scene = [
+                n for n in graph.get_nodes_by_type("SpeechNode")
+                if sd.time_range[0] <= n.t_start <= sd.time_range[1]
+            ]
+            if not speech_in_scene:
+                continue
+
+            if sd.current_speaker == "narrator":
+                speaker_node = self._get_or_create_narrator_node(graph)
+            else:
+                speaker_node = self._find_character_by_description(
+                    graph, sd.current_speaker
+                )
+
+            if speaker_node is None:
+                continue
+
+            conf = 0.9 if sd.speaker_on_screen else 0.75
+            for speech in speech_in_scene:
+                graph.add_edge(VKGEdge(
+                    source_id=speech.id, target_id=speaker_node.id,
+                    relation_type="SPOKEN_BY", weight=conf, confidence=conf,
+                    metadata={
+                        "source":    "llm_extraction",
+                        "on_screen": sd.speaker_on_screen,
+                    },
+                ))
+
+    def _build_ocr_semantic_edges(
+        self,
+        graph: VKGraph,
+        scene_data: Dict[str, SceneData],
+    ) -> None:
+        """Link OCRNodes to entities using LLM-extracted ocr_semantics."""
+        for scene_id, sd in scene_data.items():
+            if not sd.ocr_semantics:
+                continue
+            ocr_nodes_in_scene = [
+                n for n in graph.get_nodes_by_type("OCRNode")
+                if n.parent_id == scene_id
+            ]
+            scene_candidates = [
+                n for n in graph.nodes.values() if n.parent_id == scene_id
+            ]
+            for ocr_node in ocr_nodes_in_scene:
+                sem = next(
+                    (s for s in sd.ocr_semantics
+                     if s.get("text", "") == ocr_node.label),
+                    None,
+                )
+                if not sem:
+                    continue
+                ocr_node.metadata["semantic_type"] = sem.get("semantic_type", "other")
+                ocr_node.metadata["refers_to"]     = sem.get("refers_to", "")
+                refers_to = sem.get("refers_to", "")
+                if not refers_to:
+                    continue
+                target = graph.find_event_by_description(refers_to, scene_candidates)
+                if target and target.id != ocr_node.id:
+                    graph.add_edge(VKGEdge(
+                        source_id=ocr_node.id, target_id=target.id,
+                        relation_type="LABELS", weight=0.9, confidence=0.9,
+                        metadata={
+                            "source":        "llm_semantic",
+                            "semantic_type": sem.get("semantic_type"),
+                        },
+                    ))
+
+    def _get_or_create_narrator_node(self, graph: VKGraph) -> VKGNode:
+        """Return (or create once) a canonical Narrator CharacterNode."""
+        if "narrator" in graph.nodes:
+            return graph.nodes["narrator"]
+        node = VKGNode(
+            id="narrator",
+            node_type="CharacterNode",
+            label="Narrator",
+            level=0,
+            t_start=0.0,
+            t_end=1e9,
+            entity_id="entity_narrator",
+            canonical_description="narrator / voice-over",
+            metadata={"appearances": [], "entity_type": "narrator"},
+        )
+        graph.add_node(node)
+        return node
+
+    def _find_character_by_description(
+        self, graph: VKGraph, description: str
+    ) -> Optional[VKGNode]:
+        """Find the CharacterNode whose canonical_description best matches description."""
+        if not description:
+            return None
+        desc_lower = description.lower()
+        desc_words = {w for w in desc_lower.split() if len(w) > 3}
+
+        best_node, best_score = None, 0.0
+        for node in graph.get_nodes_by_type("CharacterNode"):
+            canon = (node.canonical_description or node.label or "").lower()
+            # Exact or near-exact match
+            if desc_lower in canon or canon in desc_lower:
+                return node
+            # Token Jaccard
+            canon_words = {w for w in canon.split() if len(w) > 3}
+            if not desc_words or not canon_words:
+                continue
+            score = len(desc_words & canon_words) / len(desc_words | canon_words)
+            if score > best_score:
+                best_score, best_node = score, node
+
+        return best_node if best_score >= 0.25 else None
+
+    def _build_speech_attribution_edges(self, graph: VKGraph) -> None:
+        """Heuristic speaker attribution — kept for backward compatibility; prefer _build_speaker_edges_from_extraction."""
+        speech_nodes = graph.get_nodes_by_type("SpeechNode")
+        char_nodes = graph.get_nodes_by_type("CharacterNode")
+        if not char_nodes:
+            return
+
+        # Build scene_id → list of CharacterNodes that appear in that scene
+        scene_chars: Dict[str, List[VKGNode]] = {}
+        for char in char_nodes:
+            for app in char.metadata.get("appearances", []):
+                sid = app.get("scene_id")
+                if sid:
+                    scene_chars.setdefault(sid, []).append(char)
+
+        # Build speech_id → parent scene_id via DESCRIBES edges
+        speech_scene: Dict[str, str] = {}
+        for edges in graph.edges.values():
+            for edge in edges:
+                if edge.relation_type == "DESCRIBES":
+                    src = graph.nodes.get(edge.source_id)
+                    tgt = graph.nodes.get(edge.target_id)
+                    if src and tgt and src.node_type == "SpeechNode" and tgt.node_type == "SceneNode":
+                        speech_scene[edge.source_id] = edge.target_id
+
+        for speech in speech_nodes:
+            best_char: Optional[VKGNode] = None
+
+            best_overlap = 0.0
+            for char in char_nodes:
+                overlap = max(0.0, min(speech.t_end, char.t_end) - max(speech.t_start, char.t_start))
+                if overlap > best_overlap:
+                    best_overlap, best_char = overlap, char
+
+            if best_overlap == 0.0:
+                scene_id = speech_scene.get(speech.id)
+                if scene_id and scene_id in scene_chars:
+                    best_char = scene_chars[scene_id][0]
+
+            if best_char is None:
+                speech_mid = (speech.t_start + speech.t_end) / 2
+                nearest = min(char_nodes, key=lambda c: abs((c.t_start + c.t_end) / 2 - speech_mid))
+                if abs((nearest.t_start + nearest.t_end) / 2 - speech_mid) <= 60.0:
+                    best_char = nearest
+
+            if best_char is not None:
+                confidence = 0.8 if best_overlap > 0.0 else 0.6
+                graph.add_edge(VKGEdge(
+                    source_id=speech.id, target_id=best_char.id,
+                    relation_type="SPOKEN_BY", weight=confidence, confidence=confidence,
+                    metadata={"source": "temporal_heuristic"},
+                ))
 
 
 # ------------------------------------------------------------------

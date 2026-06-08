@@ -89,7 +89,10 @@ def _extract_av(
     try:
         container = av.open(video_path)
         stream = container.streams.video[0]
-        stream.codec_context.skip_frame = "NONREF"  # faster seek
+        # Skip non-reference frames only for wide windows — for narrow windows
+        # there may be no I-frame in the span, yielding zero frames.
+        if t_end - t_start > 30:
+            stream.codec_context.skip_frame = "NONREF"
 
         # Seek to t_start
         seek_ts = int(t_start / stream.time_base)
@@ -97,6 +100,7 @@ def _extract_av(
 
         frame_interval = 1.0 / max(target_fps, 0.1)
         last_accepted_t = -999.0
+        ts = -1.0  # guard: defined even if first packet has no decodable frames
         fid = 0
 
         for packet in container.demux(stream):

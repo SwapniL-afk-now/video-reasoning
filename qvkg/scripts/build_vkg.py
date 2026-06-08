@@ -102,6 +102,7 @@ def main():
     config = {
         "frame_budget":            args.budget,
         "semantic_threshold":      0.78,
+        "semantic_k_neighbors":    10,
         "causal_min_confidence":   0.6,
         "hard_boundary_thresh":    args.hard_boundary,
         "soft_boundary_thresh":    args.soft_boundary,

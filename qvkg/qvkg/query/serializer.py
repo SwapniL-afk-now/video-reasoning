@@ -8,14 +8,16 @@ from ..schema import SubGraph
 
 # Node types that are relevant per question type — keeps prompts lean
 RELEVANT_NODE_TYPES: dict = {
-    "key information retrieval": {"OCRNode", "SpeechNode", "ClipNode"},
+    "key information retrieval": {"OCRNode", "SpeechNode", "ClipNode", "CharacterNode"},
     "entity recognition":        {"CharacterNode", "ObjectNode", "ClipNode", "SceneNode"},
-    "event understanding":       {"ActionNode", "InteractionNode", "StateChangeNode",
-                                   "ClipNode", "SceneNode"},
-    "reasoning":                 {"ActionNode", "CauseNode", "GoalNode", "SpeechNode",
-                                   "StateChangeNode", "EpisodeNode"},
-    "temporal grounding":        {"ClipNode", "SceneNode", "ActionNode", "StateChangeNode"},
-    "summarization":             {"EpisodeNode", "SceneNode", "ActionNode", "SpeechNode"},
+    "event understanding":       {"CharacterNode", "ActionNode", "InteractionNode",
+                                   "StateChangeNode", "ClipNode", "SceneNode"},
+    "reasoning":                 {"CharacterNode", "ActionNode", "CauseNode", "GoalNode",
+                                   "SpeechNode", "StateChangeNode", "EpisodeNode"},
+    "temporal grounding":        {"CharacterNode", "ClipNode", "SceneNode",
+                                   "ActionNode", "StateChangeNode"},
+    "summarization":             {"CharacterNode", "EpisodeNode", "SceneNode",
+                                   "ActionNode", "SpeechNode"},
 }
 
 # Always include these regardless of question type
@@ -81,9 +83,11 @@ class ContextSerializer:
                             if n.confidence < 0.8 else "")
                 prec_str = (f" [gap:{n.temporal_precision:.0f}s]"
                             if n.temporal_precision > 8 else "")
+                func = n.metadata.get("narrative_function", "")
+                func_str = f" [{func}]" if func else ""
                 sections.append(
                     f"  [{n.t_start:.0f}s–{n.t_end:.0f}s] "
-                    f"[{n.node_type}] {n.label}{conf_str}{prec_str}"
+                    f"[{n.node_type}]{func_str} {n.label}{conf_str}{prec_str}"
                 )
 
         # Causal chains (reasoning / causal intent)
@@ -100,31 +104,29 @@ class ContextSerializer:
                         f"    Reason: {c.metadata.get('reasoning', 'not specified')}"
                     )
 
-        # Characters (identity / entity recognition)
-        if "IDENTITY" in intents or (question_types and
-                                      any("entity" in qt for qt in question_types)):
-            chars = subgraph.get_characters()
-            if chars:
-                sections.append("\n## Characters")
-                for ch in chars:
-                    appearances = ch.metadata.get("appearances", [])
-                    times = [f"{a['timestamp']:.0f}s" for a in appearances[:8]]
-                    sections.append(
-                        f"  {ch.label}: {ch.canonical_description or ch.label}\n"
-                        f"    Appears at: {', '.join(times) or 'unknown'}"
-                    )
+        # Characters (always included — critical for all question types)
+        chars = subgraph.get_characters()
+        if chars:
+            sections.append("\n## Characters")
+            for ch in chars:
+                appearances = ch.metadata.get("appearances", [])
+                times = [f"{a['timestamp']:.0f}s" for a in appearances[:8]]
+                emotions = [a["emotion"] for a in appearances if a.get("emotion")]
+                emotion_str = f" [{emotions[-1]}]" if emotions else ""
+                sections.append(
+                    f"  {ch.label}{emotion_str}: {ch.canonical_description or ch.label}\n"
+                    f"    Appears at: {', '.join(times) or 'unknown'}"
+                )
 
-        # State changes
-        if "STATE" in intents or (question_types and
-                                   any("event" in qt for qt in question_types)):
-            states = subgraph.get_state_changes()
-            if states:
-                sections.append("\n## State Changes")
-                for s in states:
-                    sections.append(
-                        f"  [{s.t_start:.0f}s] {s.metadata.get('entity', s.label)}: "
-                        f"{s.prev_state} → {s.next_state}"
-                    )
+        # State changes (always included)
+        states = subgraph.get_state_changes()
+        if states:
+            sections.append("\n## State Changes")
+            for s in states:
+                sections.append(
+                    f"  [{s.t_start:.0f}s] {s.metadata.get('entity', s.label)}: "
+                    f"{s.prev_state} → {s.next_state}"
+                )
 
         # Spatial layout
         if "SPATIAL" in intents:
@@ -140,12 +142,35 @@ class ContextSerializer:
                             f"  [{src.t_start:.0f}s] {src.label} {rel_str} {tgt.label}"
                         )
 
+        # Episode summaries for summarization questions
+        if question_types and any("summarization" in qt for qt in question_types):
+            eps = sorted(
+                [n for n in subgraph.nodes.values() if n.node_type == "EpisodeNode"],
+                key=lambda n: n.t_start,
+            )
+            if eps:
+                sections.append("\n## Episode Summaries")
+                for ep in eps:
+                    summary = ep.metadata.get("summary", "")
+                    sections.append(
+                        f"  [{ep.t_start:.0f}s–{ep.t_end:.0f}s] {ep.label}"
+                        + (f" — {summary[:100]}" if summary else "")
+                    )
+
         # Dialogue
         speeches = subgraph.get_speech_nodes()
         if speeches:
             sections.append("\n## Dialogue")
+            spoken_by: dict = {}
+            for edge in subgraph.edges:
+                if edge.relation_type == "SPOKEN_BY":
+                    char = subgraph.nodes.get(edge.target_id)
+                    if char:
+                        spoken_by[edge.source_id] = char.label[:30]
             for s in speeches[:12]:
-                sections.append(f'  [{s.t_start:.0f}s] "{s.label}"')
+                speaker = spoken_by.get(s.id, "")
+                speaker_str = f"{speaker}: " if speaker else ""
+                sections.append(f'  [{s.t_start:.0f}s] {speaker_str}"{s.label}"')
 
         context = "\n".join(sections)
         return (

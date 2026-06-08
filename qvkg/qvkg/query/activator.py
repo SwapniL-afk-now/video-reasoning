@@ -63,10 +63,27 @@ class SubgraphActivator:
                         activated |= set(
                             self.graph.entity_idx.get(node.entity_id, [])
                         )
-                    # Also activate all CharacterNodes
+                    # Also activate all CharacterNodes with same entity_id
                     for cnode in self.graph.get_nodes_by_type("CharacterNode"):
                         if cnode.entity_id == node.entity_id:
                             activated.add(cnode.id)
+                    # Follow SAME_ENTITY edges in both directions
+                    for edge in self.graph.get_edges(node.id):
+                        if edge.relation_type == "SAME_ENTITY":
+                            activated.add(edge.target_id)
+                    for edge in self.graph.get_incoming_edges(node.id):
+                        if edge.relation_type == "SAME_ENTITY":
+                            activated.add(edge.source_id)
+                # Narrator node: activate if question references voice-over
+                q_lower = question.lower()
+                if any(w in q_lower for w in
+                       ("narrator", "voiceover", "voice over", "narration", "voice-over")):
+                    narrator = self.graph.nodes.get("narrator")
+                    if narrator:
+                        activated.add("narrator")
+                        activated |= set(
+                            self.graph.entity_idx.get("entity_narrator", [])
+                        )
 
             elif intent == "SPATIAL":
                 for node in seeds:
@@ -146,6 +163,13 @@ class SubgraphActivator:
                         activated |= set(
                             self.graph.entity_idx.get(node.entity_id, [])
                         )
+                    # Follow SAME_ENTITY edges in both directions
+                    for edge in self.graph.get_edges(node.id):
+                        if edge.relation_type == "SAME_ENTITY":
+                            activated.add(edge.target_id)
+                    for edge in self.graph.get_incoming_edges(node.id):
+                        if edge.relation_type == "SAME_ENTITY":
+                            activated.add(edge.source_id)
 
             elif intent == "SPATIAL":
                 for node in seeds:

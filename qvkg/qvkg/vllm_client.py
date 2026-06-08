@@ -15,7 +15,8 @@ from vllm.sampling_params import StructuredOutputsParams
 SCENE_EXTRACTION_SCHEMA = {
     "type": "object",
     "required": ["scene_label", "objects", "actions", "spatial_relations",
-                 "characters", "ocr_text", "state_changes", "scene_mood"],
+                 "characters", "ocr_text", "ocr_semantics", "state_changes",
+                 "scene_mood", "current_speaker", "speaker_on_screen", "narrative_function"],
     "properties": {
         "reasoning": {
             "type": "string",
@@ -29,9 +30,10 @@ SCENE_EXTRACTION_SCHEMA = {
             "type": "array",
             "items": {
                 "type": "object",
-                "required": ["label", "bbox_norm", "confidence"],
+                "required": ["label", "bbox_norm", "confidence", "attributes", "state"],
                 "properties": {
-                    "label":      {"type": "string"},
+                    "label":      {"type": "string",
+                                   "description": "object name e.g. 'red sports car', 'wooden table', 'glass bottle'"},
                     "bbox_norm":  {
                         "type": "array",
                         "items": {"type": "number"},
@@ -39,9 +41,10 @@ SCENE_EXTRACTION_SCHEMA = {
                         "description": "[x1, y1, x2, y2] normalized 0-1"
                     },
                     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "attributes": {"type": "array", "items": {"type": "string"}},
+                    "attributes": {"type": "array", "items": {"type": "string"},
+                                   "description": "visual attributes e.g. red, wooden, large, shiny"},
                     "state":      {"type": "string",
-                                   "description": "current state, e.g. 'on', 'open', 'broken'"}
+                                   "description": "current state, e.g. 'on', 'open', 'broken', 'full', 'empty'"}
                 }
             }
         },
@@ -79,36 +82,44 @@ SCENE_EXTRACTION_SCHEMA = {
         },
         "characters": {
             "type": "array",
+            "description": "CRITICAL: Every visible person in this scene MUST be listed here",
             "items": {
                 "type": "object",
                 "required": ["description", "bbox_norm", "emotion"],
                 "properties": {
                     "description": {
                         "type": "string",
-                        "description": "Distinctive appearance: gender, age, clothing, hair"
+                        "description": "Distinctive appearance: gender, age, clothing, hair, accessories"
                     },
                     "bbox_norm":   {
                         "type": "array",
                         "items": {"type": "number"},
-                        "minItems": 4, "maxItems": 4
+                        "minItems": 4, "maxItems": 4,
+                        "description": "[x1, y1, x2, y2] normalized 0-1"
                     },
-                    "emotion": {"type": "string"},
-                    "action":  {"type": "string"}
+                    "emotion": {"type": "string",
+                                "description": "emotional state of this person e.g. happy, sad, neutral, angry, surprised"},
+                    "action":  {"type": "string",
+                                "description": "what this person is doing e.g. walking, talking, eating, cooking"}
                 }
             }
         },
         "ocr_text": {
             "type": "array",
+            "description": "CRITICAL: Every piece of visible text in the scene",
             "items": {
                 "type": "object",
+                "required": ["text"],
                 "properties": {
-                    "text":       {"type": "string"},
+                    "text":       {"type": "string",
+                                   "description": "Exact text content, read carefully"},
                     "bbox_norm":  {
                         "type": "array",
                         "items": {"type": "number"},
-                        "minItems": 4, "maxItems": 4
+                        "minItems": 4, "maxItems": 4,
+                        "description": "[x1, y1, x2, y2] normalized 0-1"
                     },
-                    "confidence": {"type": "number"}
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
                 }
             }
         },
@@ -133,6 +144,106 @@ SCENE_EXTRACTION_SCHEMA = {
             "type": "string",
             "enum": ["tense", "calm", "joyful", "sad", "urgent",
                      "neutral", "comedic", "dramatic"]
+        },
+        "current_speaker": {
+            "type": "string",
+            "description": (
+                "Who is speaking during this scene. If a visible character is speaking, "
+                "use their description matching the characters array (e.g., 'woman in red jacket'). "
+                "If speech is heard but no speaker is visible (voice-over, off-screen commentary), "
+                "use 'narrator'. If no speech or unclear, use 'unknown'."
+            )
+        },
+        "speaker_on_screen": {
+            "type": "boolean",
+            "description": "Is the speaking person visible in any frame of this scene?"
+        },
+        "narrative_function": {
+            "type": "string",
+            "enum": ["action", "dialogue", "exposition", "transition",
+                     "reaction", "commentary", "highlight", "interview"],
+            "description": "The narrative role this scene plays in the overall video structure"
+        },
+        "ocr_semantics": {
+            "type": "array",
+            "description": "Semantic interpretation of each OCR text item — parallel to ocr_text",
+            "items": {
+                "type": "object",
+                "required": ["text", "semantic_type", "refers_to"],
+                "properties": {
+                    "text": {"type": "string", "description": "Exact text matching an entry in ocr_text"},
+                    "semantic_type": {
+                        "type": "string",
+                        "enum": ["price", "name", "score", "time", "title",
+                                 "caption", "subtitle", "label", "brand",
+                                 "location", "stat", "other"]
+                    },
+                    "refers_to": {
+                        "type": "string",
+                        "description": (
+                            "What entity or concept does this text describe? "
+                            "e.g. 'salmon sashimi dish on left plate', 'game clock', "
+                            "'chapter heading', 'player wearing jersey #23'"
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+VIDEO_TYPE_SCHEMA = {
+    "type": "object",
+    "required": ["video_type", "has_narrator_voiceover", "has_multiple_speakers",
+                 "dominant_language"],
+    "properties": {
+        "video_type": {
+            "type": "string",
+            "enum": ["movie", "sports", "documentary", "vlog", "tutorial",
+                     "news", "educational", "entertainment", "other"]
+        },
+        "has_narrator_voiceover": {"type": "boolean"},
+        "has_multiple_speakers":  {"type": "boolean"},
+        "dominant_language":      {"type": "string"},
+        "key_characteristics": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "e.g. 'score overlays', 'cooking demonstrations', 'interview segments'"
+        }
+    }
+}
+
+ENTITY_RESOLUTION_SCHEMA = {
+    "type": "array",
+    "description": "One entry per unique real-world person identified across all scenes",
+    "items": {
+        "type": "object",
+        "required": ["canonical_id", "canonical_name", "canonical_description",
+                     "description_variants", "entity_type"],
+        "properties": {
+            "canonical_id": {
+                "type": "string",
+                "description": "Short stable identifier, e.g. 'host', 'player_23', 'detective_brown'"
+            },
+            "canonical_name": {
+                "type": "string",
+                "description": "Best known name or role, e.g. 'David', 'Goalkeeper #1', 'Narrator'"
+            },
+            "canonical_description": {
+                "type": "string",
+                "description": "Most complete single appearance description"
+            },
+            "description_variants": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "All raw description strings from scenes that belong to this entity"
+            },
+            "entity_type": {
+                "type": "string",
+                "enum": ["main_character", "supporting_character", "background",
+                         "narrator", "interviewer", "interviewee",
+                         "athlete", "anchor", "host", "other"]
+            }
         }
     }
 }
@@ -183,7 +294,7 @@ EPISODE_SCHEMA = {
 # System prompts
 # ---------------------------------------------------------------------------
 
-SCENE_SYSTEM_PROMPT = (
+_SCENE_BASE_PROMPT = (
     "You are a video analysis system. You receive multiple frames from a single "
     "video scene in chronological order. Each frame is labeled with its timestamp. "
     "Extract structured information about the scene as JSON.\n\n"
@@ -193,15 +304,109 @@ SCENE_SYSTEM_PROMPT = (
     "Be precise about spatial positions (use normalized coordinates 0-1). "
     "For characters, provide distinctive appearance descriptions to enable "
     "cross-scene re-identification (e.g., 'young woman, black jacket, short brown "
-    "hair, glasses'). Analyze and report each character's emotion.\n\n"
-    "IMPORTANT: For every person detected, include them in BOTH the 'objects' array "
-    "(with label like 'man', 'woman', 'chef') AND the 'characters' array "
-    "(with full description, emotion, and bbox). This ensures complete character tracking.\n\n"
-    "Report any visible text in the scene (signs, labels, prices, on-screen titles, "
-    "social media comments) in the 'ocr_text' array with the text content and location.\n\n"
+    "hair, glasses').\n\n"
+    "CRITICAL — EMOTION ANALYSIS: For EVERY character you detect, you MUST analyze "
+    "and report their emotional state based on facial expression, body language, "
+    "and context. Possible emotions include: happy, sad, angry, surprised, neutral, "
+    "excited, disappointed, nervous, relaxed, confused, hopeful, or describe other "
+    "emotions you observe. Never leave emotion empty.\n\n"
+    "CRITICAL — CHARACTER DETECTION: You MUST detect EVERY person visible in ANY frame "
+    "of this scene, including people who are partially visible, in the background, "
+    "or shown from behind. For EVERY person you see, you MUST:\n"
+    "  1. Add them to the 'characters' array with full description (gender, age, "
+    "clothing, hair, distinctive features), bbox, emotion, and action\n"
+    "  2. ALSO add them to the 'objects' array with label like 'man', 'woman', 'chef'\n"
+    "If NO people are visible in ANY frame, the 'characters' array should be empty. "
+    "But if even one person appears, they MUST be included.\n\n"
+    "CRITICAL — OCR TEXT EXTRACTION: You MUST read ALL visible text from EVERY frame. "
+    "Do not skip any frame. For each frame, check for:\n"
+    "  - Signs, posters, banners, billboards\n"
+    "  - Product labels, prices, menus\n"
+    "  - On-screen titles, subtitles, captions\n"
+    "  - Social media comments, usernames, timestamps\n"
+    "  - Phone numbers, URLs, brand names\n"
+    "  - Any other text of any size or font\n\n"
+    "Transcribe the EXACT text content — every character matters, including digits, "
+    "symbols, and punctuation. If there are multiple text elements, list EACH ONE "
+    "separately in the 'ocr_text' array with its approximate location. "
+    "DO NOT SKIP any text. If text resolution is low, do your best to read it "
+    "character by character.\n\n"
     "For state changes, note the approximate timestamp when the transition occurs. "
-    "Only report observations you can directly verify in the frames."
+    "Only report observations you can directly verify in the frames.\n\n"
+    "SPEAKER ATTRIBUTION: Set 'current_speaker' to the description of the visible "
+    "person who is speaking (matching the characters array), 'narrator' if speech "
+    "is heard but no speaker is visible on screen, or 'unknown' if silent/unclear. "
+    "Set 'speaker_on_screen' accordingly. "
+    "Set 'narrative_function' to the role this scene plays: action, dialogue, "
+    "exposition, transition, reaction, commentary, highlight, or interview.\n\n"
+    "OCR SEMANTICS: For each item in ocr_text, add a parallel entry in ocr_semantics "
+    "describing what the text refers to (e.g., '¥980' refers to 'salmon dish price', "
+    "'23:47' refers to 'game clock', 'CHAPTER 3' refers to 'chapter heading')."
 )
+
+_TYPE_ADDENDA = {
+    "sports": (
+        "\nSPORTS VIDEO: Jersey numbers and team colors are primary player identity cues — "
+        "always include them in character descriptions. OCR overlays contain scores, "
+        "game clocks, and player name chyrons — extract them exactly with semantic_type "
+        "'score', 'time', or 'name'. Note game events (goal, foul, tackle, serve) as actions. "
+        "The commentator/announcer is typically off-screen; set current_speaker='narrator' "
+        "when their voice is heard with no visible speaker."
+    ),
+    "movie": (
+        "\nMOVIE/DRAMA: Focus on character emotional performance and precise dialogue "
+        "attribution. Match current_speaker to the character description in the characters "
+        "array — the speaking character is usually the one with the most expressive face or "
+        "open mouth. Note scene blocking (who is in foreground vs. background). "
+        "Identify characters by consistent appearance markers (costume, hairstyle)."
+    ),
+    "documentary": (
+        "\nDOCUMENTARY: This video likely has narrator voice-over. When narration is heard "
+        "with no visible speaker, set current_speaker='narrator' and speaker_on_screen=false. "
+        "For interview segments (person talking directly to camera or interviewer), set "
+        "narrative_function='interview'. Identify experts by on-screen text labels (chyrons) "
+        "when present — extract them as ocr_text with semantic_type='name'."
+    ),
+    "vlog": (
+        "\nVLOG/TUTORIAL: The main host is typically the primary on-screen speaker throughout. "
+        "Extract food, product, and location names precisely in object labels. "
+        "Price tags and menus are critical OCR targets — use semantic_type='price' for costs "
+        "and refers_to the specific item. Capture the host's emotional reactions closely."
+    ),
+    "news": (
+        "\nNEWS BROADCAST: Chyrons (lower-third graphics showing names/titles) are critical "
+        "named entity information — extract them verbatim with semantic_type='name'. "
+        "Identify on-screen anchors, field reporters, and interview subjects. "
+        "Breaking news tickers should be extracted as ocr_text with semantic_type='caption'."
+    ),
+    "tutorial": (
+        "\nTUTORIAL/EDUCATIONAL: Focus on what is being demonstrated. Extract all on-screen "
+        "text (step numbers, labels, captions) with their semantic meaning. The instructor "
+        "is typically the current_speaker when visible on screen."
+    ),
+}
+
+
+def build_scene_system_prompt(
+    video_type: str = "",
+    has_narrator: bool = False,
+) -> str:
+    """Return the scene extraction system prompt conditioned on video type."""
+    prompt = _SCENE_BASE_PROMPT
+    addendum = _TYPE_ADDENDA.get(video_type, "")
+    if addendum:
+        prompt += addendum
+    if has_narrator and video_type not in ("documentary", "sports"):
+        prompt += (
+            "\nIMPORTANT: This video contains narrator voice-over. When speech is heard "
+            "but no speaker face is visible, always set current_speaker='narrator' and "
+            "speaker_on_screen=false."
+        )
+    return prompt
+
+
+# Keep the constant for backward compatibility — resolves to the generic prompt
+SCENE_SYSTEM_PROMPT = build_scene_system_prompt()
 
 CAUSAL_SYSTEM_PROMPT = (
     "You are analyzing a video episode to identify causal relationships between "
@@ -215,17 +420,107 @@ CAUSAL_SYSTEM_PROMPT = (
     "observations from the frames or timeline. Return JSON."
 )
 
+VIDEO_TYPE_SYSTEM_PROMPT = (
+    "You are a video content classifier. You receive a sample of frames from a video. "
+    "Determine the video type, whether it has narrator voice-over, whether multiple "
+    "speakers are present, the dominant spoken language, and key visual characteristics "
+    "that should guide content extraction. Return JSON."
+)
+
+ENTITY_RESOLUTION_SYSTEM_PROMPT = (
+    "You are resolving character identity across a long video. "
+    "You will receive a list of character descriptions extracted from different scenes "
+    "at different timestamps. Your task: identify which descriptions refer to the same "
+    "real-world person and group them into canonical entities.\n\n"
+    "Use ALL available cues:\n"
+    "  - Physical features: face, hair, build, age\n"
+    "  - Clothing and accessories (consistent across scenes)\n"
+    "  - Jersey numbers and team colors (sports)\n"
+    "  - On-screen name labels or chyrons\n"
+    "  - Narrative role (host, interviewer, athlete, etc.)\n"
+    "  - Temporal context (same person likely has consistent role)\n\n"
+    "For sports: jersey numbers and team colors are the strongest identity cues. "
+    "For interviews: distinguish interviewer (behind camera) from interviewee (facing camera). "
+    "For documentaries: 'narrator' is a special entity for off-screen voice-over.\n\n"
+    "Assign each entity a short canonical_id like 'host', 'player_23_red', "
+    "'detective_brown', 'narrator', 'vendor_1'. "
+    "Return a JSON array where each entry is one unique real-world person."
+)
+
 EPISODE_SYSTEM_PROMPT = (
     "You are a narrative analyst. You receive an ordered list of scene descriptions "
     "from a video. Group them into 10-30 narrative episodes — coherent story segments "
     "with a clear beginning and end.\n\n"
     "Each episode should represent a distinct narrative beat: an introduction, a "
-    "conflict, a resolution, a transition, etc. Return a JSON array of episodes."
+    "conflict, a resolution, a transition, etc. Return a JSON array of episodes.\n\n"
+    "CRITICAL: Each episode label MUST be a short descriptive phrase (4-8 words) that "
+    "captures the specific topic or activity — for example 'Raw chicken tasting at "
+    "Tokyo market' or 'Exploring Tsukiji seafood stalls'. Do NOT use generic labels "
+    "like 'Episode 1' or 'Introduction'."
+)
+
+# ---------------------------------------------------------------------------
+# Planner schema + prompt (two-stage QA)
+# ---------------------------------------------------------------------------
+
+PLANNER_SCHEMA = {
+    "type": "object",
+    "required": ["windows", "search_queries", "needs_frames"],
+    "properties": {
+        "windows": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["t_start", "t_end"],
+                "properties": {
+                    "t_start": {"type": "number"},
+                    "t_end":   {"type": "number"},
+                },
+            },
+        },
+        "search_queries": {"type": "array", "items": {"type": "string"}},
+        "needs_frames":   {"type": "boolean"},
+        "reasoning":      {"type": "string"},
+    },
+}
+
+PLANNER_SYSTEM_PROMPT = (
+    "You are a retrieval planner for a video QA system. "
+    "You will receive a question, its type, a time reference, and the video's episode structure. "
+    "Output a JSON retrieval plan:\n\n"
+    "- windows: time windows (seconds) to retrieve detailed nodes from. "
+    "For pinpoint timestamp questions, include that timestamp window. "
+    "For broad narrative questions, leave empty and rely on search_queries instead.\n"
+    "- search_queries: 1-4 text queries to search the knowledge graph. "
+    "Use specific terms from the question. For ordering questions (last/first), "
+    "include the entity type so all occurrences can be found and compared.\n"
+    "- needs_frames: true if the question requires visual identification at a specific moment "
+    "(on-screen text, object appearance, action at a timestamp). "
+    "False for narrative, ordering, causal, or summary questions.\n"
+    "- reasoning: one sentence explaining your plan."
 )
 
 # ---------------------------------------------------------------------------
 # Sampling params
 # ---------------------------------------------------------------------------
+
+PLANNER_SAMPLING = SamplingParams(
+    temperature=0,
+    max_tokens=512,
+    structured_outputs=StructuredOutputsParams(json=PLANNER_SCHEMA),
+)
+
+VIDEO_TYPE_SAMPLING = SamplingParams(
+    temperature=0,
+    max_tokens=512,
+    structured_outputs=StructuredOutputsParams(json=VIDEO_TYPE_SCHEMA),
+)
+
+ENTITY_RESOLUTION_SAMPLING = SamplingParams(
+    temperature=0,
+    max_tokens=32768,
+    structured_outputs=StructuredOutputsParams(json=ENTITY_RESOLUTION_SCHEMA),
+)
 
 OFFLINE_SAMPLING = SamplingParams(
     temperature=0,
@@ -241,23 +536,24 @@ CAUSAL_SAMPLING = SamplingParams(
 
 QA_SAMPLING = SamplingParams(
     temperature=0,
-    max_tokens=2048,
+    max_tokens=32768,
 )
 
-# Multiple-choice: free-form reasoning + answer letter extraction.
-# The model thinks step-by-step then outputs a single answer letter.
+# Multiple-choice: model reasons freely inside <think>…</think> then answers.
+# max_tokens covers both the thinking trace and the final answer letter.
 MCQ_REASONING_SAMPLING = SamplingParams(
     temperature=0,
-    max_tokens=2048,
-    # No structured_outputs — let the model reason freely
+    max_tokens=8192,
+    # No structured_outputs — let the model reason freely with thinking enabled
 )
 
 MCQ_SYSTEM_PROMPT = (
-    "You are answering a multiple choice question about a video. "
-    "Study the provided frames and knowledge context carefully. "
-    "First, think step-by-step about the evidence from the frames and knowledge. "
-    "Consider each choice in turn. Then output ONLY the letter of the correct "
-    "answer: A, B, C, or D. The answer letter must be on its own line at the end."
+    "You are a video analyst answering a multiple choice question. "
+    "You are given frames from the video and structured knowledge extracted from it.\n\n"
+    "Think carefully and thoroughly inside your thinking block: examine each frame, "
+    "review the timeline and characters, then evaluate each option (A, B, C, D) "
+    "against the evidence — timestamps, visual details, dialogue, and OCR text.\n\n"
+    "After your thinking, output ONE line containing ONLY the answer letter: A, B, C, or D."
 )
 
 
