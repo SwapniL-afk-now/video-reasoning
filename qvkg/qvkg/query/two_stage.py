@@ -75,8 +75,9 @@ _ANSWERER_SYSTEM = (
     "For multiple-choice questions, output exactly one letter: A, B, C, or D."
 )
 
-MAX_NODES = 40   # max nodes to include in answerer context
-MAX_FRAMES = 8   # max frames to pass to answerer
+MAX_NODES = 40       # max nodes to include in answerer context
+MAX_FRAMES = 8       # default max frames (non-visual questions)
+VLM_IMAGE_LIMIT = 10 # hard vLLM limit per prompt
 
 
 # ---------------------------------------------------------------------------
@@ -375,12 +376,12 @@ def _assemble_context(
             )
             all_frames.extend(frames)
 
-    # Cap total frames
+    # Cap total frames at budget (may exceed VLM_IMAGE_LIMIT — batching handles it)
     all_frames = all_frames[:frame_budget]
     b64_urls = frames_to_b64_urls(all_frames)
     frame_ts = [f.timestamp for f in all_frames]
 
-    # --- Build context text ---
+    # --- Build context text (shared across all frame batches) ---
     episodes_text = executor._list_episodes()
     qt_str = ", ".join(question_type) if question_type else ""
 
@@ -416,14 +417,64 @@ def _assemble_context(
 
     context_text = "\n\n".join(context_parts)
 
-    # --- Assemble multimodal content ---
-    content = []
-    for url, ts in zip(b64_urls, frame_ts):
-        content.append({"type": "image_url", "image_url": {"url": url}})
-        content.append({"type": "text", "text": f"[t={ts:.1f}s]"})
-    content.append({"type": "text", "text": context_text})
+    return context_text, len(all_nodes), frame_ts, b64_urls
 
-    return content, len(all_nodes), frame_ts, b64_urls
+
+# ---------------------------------------------------------------------------
+# Frame batching — overlapping windows with context propagation
+# ---------------------------------------------------------------------------
+
+def _make_frame_batches(
+    b64_urls: List[str],
+    frame_ts: List[float],
+    context_text: str,
+    batch_size: int = VLM_IMAGE_LIMIT,
+    overlap: int = 2,
+) -> List[List[dict]]:
+    """Split frames into overlapping batches, each carrying the shared context.
+
+    Each batch is a content list: [image, timestamp, image, timestamp, ..., context_text].
+    Overlap ensures temporal continuity — the last `overlap` frames of batch N
+    are the first `overlap` frames of batch N+1.
+    """
+    if len(b64_urls) <= batch_size:
+        # Single batch — no splitting needed
+        content = []
+        for url, ts in zip(b64_urls, frame_ts):
+            content.append({"type": "image_url", "image_url": {"url": url}})
+            content.append({"type": "text", "text": f"[t={ts:.1f}s]"})
+        content.append({"type": "text", "text": context_text})
+        return [content]
+
+    batches = []
+    step = batch_size - overlap
+    for start in range(0, len(b64_urls), step):
+        end = min(start + batch_size, len(b4_urls) if False else len(b64_urls))
+        batch_urls = b64_urls[start:end]
+        batch_ts = frame_ts[start:end]
+
+        content = []
+        for url, ts in zip(batch_urls, batch_ts):
+            content.append({"type": "image_url", "image_url": {"url": url}})
+            content.append({"type": "text", "text": f"[t={ts:.1f}s]"})
+        content.append({"type": "text", "text": context_text})
+        batches.append(content)
+
+        if end >= len(b64_urls):
+            break
+    return batches
+
+
+def _merge_batch_answers(answers: List[str]) -> str:
+    """Merge per-batch MCQ answers via majority vote."""
+    from collections import Counter
+    if not answers:
+        return "ERROR"
+    # Filter out ERROR/empty
+    valid = [a for a in answers if a and a != "ERROR"]
+    if not valid:
+        return "ERROR"
+    return Counter(valid).most_common(1)[0][0]
 
 
 # ---------------------------------------------------------------------------
@@ -443,7 +494,12 @@ def two_stage_answer_question(
     debug_dir: Optional[str] = None,
     uid: str = "unknown",
 ) -> AnswerResult:
-    """Two-stage answer: planner call → context assembly → answerer call."""
+    """Two-stage answer: planner call → context assembly → batched answerer call.
+
+    When > VLM_IMAGE_LIMIT frames are retrieved, they are split into overlapping
+    batches. Each batch carries the full graph context + the previous batch's
+    answer as continuity signal. Final answer via majority vote.
+    """
 
     executor = GraphToolExecutor(graph, faiss_index, siglip_encoder, video_path)
 
@@ -456,8 +512,8 @@ def two_stage_answer_question(
         llm=llm,
     )
 
-    # Stage 2: assemble context
-    content, node_count, frame_ts, b64_urls = _assemble_context(
+    # Stage 2: assemble context (returns context_text + all frames uncapped)
+    context_text, node_count, frame_ts, b64_urls = _assemble_context(
         plan=plan,
         executor=executor,
         video_path=video_path,
@@ -466,26 +522,49 @@ def two_stage_answer_question(
         question_type=question_type,
     )
 
-    # Extract text from content for logging
-    context_text_parts = [c["text"] for c in content if isinstance(c, dict) and c.get("type") == "text"]
-    context_text_logged = "\n".join(context_text_parts)
-
-    # Stage 2: answerer call
+    # Stage 3: frame batching with context propagation
+    batches = _make_frame_batches(b64_urls, frame_ts, context_text)
     sampling = MCQ_REASONING_SAMPLING if mcq else QA_SAMPLING
-    messages = [
-        {"role": "system", "content": _ANSWERER_SYSTEM},
-        {"role": "user",   "content": content},
-    ]
+    batch_answers: List[str] = []
+    batch_raws: List[str] = []
 
-    output = llm.chat(
-        messages=[messages],
-        sampling_params=sampling,
-        chat_template_kwargs={"enable_thinking": mcq},
-        use_tqdm=False,
-    )[0]
+    prev_answer_hint = ""
+    for batch_idx, batch_content in enumerate(batches):
+        # Prepend previous batch's answer as continuity signal
+        if prev_answer_hint:
+            # Insert before the context text block
+            hint_text = (
+                f"## Previous batch analysis\n"
+                f"{prev_answer_hint}\n\n"
+                f"Consider the above when answering. "
+                f"If the evidence in the current frames conflicts, prefer the current frames."
+            )
+            # Find the context text entry and prepend hint
+            for i, item in enumerate(batch_content):
+                if item.get("type") == "text" and "Question:" in item.get("text", ""):
+                    batch_content[i] = {"type": "text", "text": hint_text + "\n\n" + item["text"]}
+                    break
 
-    raw = output.outputs[0].text.strip()
-    answer = extract_mcq_answer(raw) if mcq else raw
+        messages = [
+            {"role": "system", "content": _ANSWERER_SYSTEM},
+            {"role": "user",   "content": batch_content},
+        ]
+
+        output = llm.chat(
+            messages=[messages],
+            sampling_params=sampling,
+            chat_template_kwargs={"enable_thinking": mcq},
+            use_tqdm=False,
+        )[0]
+
+        raw = output.outputs[0].text.strip()
+        answer = extract_mcq_answer(raw) if mcq else raw
+        batch_answers.append(answer)
+        batch_raws.append(raw)
+        prev_answer_hint = raw
+
+    # Merge batch answers
+    final_answer = _merge_batch_answers(batch_answers)
 
     # Debug logging
     if debug_dir:
@@ -501,15 +580,17 @@ def two_stage_answer_question(
                 "plan": plan,
                 "n_nodes": node_count,
                 "frame_timestamps": frame_ts,
-                "context_text": context_text_logged,
+                "context_text": context_text,
                 "answerer_system": _ANSWERER_SYSTEM,
-                "answerer_raw_output": raw,
-                "predicted_answer": answer,
+                "answerer_raw_output": "\n---BATCH---\n".join(batch_raws),
+                "predicted_answer": final_answer,
+                "batch_answers": batch_answers,
+                "n_batches": len(batches),
             },
         )
 
     return AnswerResult(
-        answer=answer,
+        answer=final_answer,
         intents=[plan.get("reasoning", "")],
         subgraph_size=node_count,
         keyframes_used=frame_ts,
@@ -531,10 +612,12 @@ def batch_two_stage_answer_questions(
     mcq: bool = True,
     debug_dir: Optional[str] = None,
 ) -> List[AnswerResult]:
-    """Batch two-stage: 1 planner LLM call + 1 answerer LLM call for all questions.
+    """Batch two-stage: 1 planner LLM call + frame-batched answerer calls.
 
-    Each element of `questions` must have keys:
-        question, question_type (list), time_reference (str|None), uid (str)
+    For each question:
+      - Frames are split into overlapping batches of VLM_IMAGE_LIMIT
+      - Each batch carries the full graph context + previous batch's answer
+      - Final answer via majority vote across batches
     """
     executor = GraphToolExecutor(graph, faiss_index, siglip_encoder, video_path)
     episodes_text = executor._list_episodes()
@@ -582,14 +665,15 @@ def batch_two_stage_answer_questions(
                 "reasoning": "",
             })
 
-    # --- Stage 2: context assembly (CPU/IO, sequential between GPU calls) ---
-    all_contents: List = []
+    # --- Stage 2: context assembly + frame batching (CPU/IO) ---
+    all_context_texts: List[str] = []
     all_node_counts: List[int] = []
     all_frame_ts: List = []
     all_b64_urls: List = []
+    all_batches: List[List[List[dict]]] = []  # per-question list of batches
 
     for q, plan in zip(questions, plans):
-        content, node_count, frame_ts, b64_urls = _assemble_context(
+        context_text, node_count, frame_ts, b64_urls = _assemble_context(
             plan=plan,
             executor=executor,
             video_path=video_path,
@@ -597,38 +681,58 @@ def batch_two_stage_answer_questions(
             question=q["question"],
             question_type=q.get("question_type"),
         )
-        all_contents.append(content)
+        batches = _make_frame_batches(b64_urls, frame_ts, context_text)
+        all_context_texts.append(context_text)
         all_node_counts.append(node_count)
         all_frame_ts.append(frame_ts)
         all_b64_urls.append(b64_urls)
+        all_batches.append(batches)
 
-    # --- Stage 3: batch answerer (all questions in one llm.chat call) ---
-    answerer_msgs = [
-        [
-            {"role": "system", "content": _ANSWERER_SYSTEM},
-            {"role": "user",   "content": content},
-        ]
-        for content in all_contents
-    ]
+    # --- Stage 3: batched answerer (per-question, per-batch with context propagation) ---
     sampling = MCQ_REASONING_SAMPLING if mcq else QA_SAMPLING
-    answerer_outputs = llm.chat(
-        messages=answerer_msgs,
-        sampling_params=sampling,
-        chat_template_kwargs={"enable_thinking": mcq},
-        use_tqdm=False,
-    )
-
-    # --- Collect results ---
     results: List[AnswerResult] = []
-    for i, (q, plan, output) in enumerate(zip(questions, plans, answerer_outputs)):
-        raw = output.outputs[0].text.strip()
-        answer = extract_mcq_answer(raw) if mcq else raw
+
+    for i, (q, plan, batches) in enumerate(zip(questions, plans, all_batches)):
+        batch_answers: List[str] = []
+        batch_raws: List[str] = []
+        prev_answer_hint = ""
+
+        for batch_idx, batch_content in enumerate(batches):
+            # Prepend previous batch's answer as continuity signal
+            if prev_answer_hint:
+                hint_text = (
+                    f"## Previous batch analysis\n"
+                    f"{prev_answer_hint}\n\n"
+                    f"Consider the above when answering. "
+                    f"If the evidence in the current frames conflicts, prefer the current frames."
+                )
+                for ci, item in enumerate(batch_content):
+                    if item.get("type") == "text" and "Question:" in item.get("text", ""):
+                        batch_content[ci] = {"type": "text", "text": hint_text + "\n\n" + item["text"]}
+                        break
+
+            messages = [
+                {"role": "system", "content": _ANSWERER_SYSTEM},
+                {"role": "user",   "content": batch_content},
+            ]
+
+            output = llm.chat(
+                messages=[messages],
+                sampling_params=sampling,
+                chat_template_kwargs={"enable_thinking": mcq},
+                use_tqdm=False,
+            )[0]
+
+            raw = output.outputs[0].text.strip()
+            answer = extract_mcq_answer(raw) if mcq else raw
+            batch_answers.append(answer)
+            batch_raws.append(raw)
+            prev_answer_hint = raw
+
+        # Merge batch answers via majority vote
+        final_answer = _merge_batch_answers(batch_answers)
 
         if debug_dir:
-            ctx_text = "\n".join(
-                c["text"] for c in all_contents[i]
-                if isinstance(c, dict) and c.get("type") == "text"
-            )
             _save_debug_record(
                 debug_dir=debug_dir,
                 uid=q.get("uid", str(i)),
@@ -641,15 +745,17 @@ def batch_two_stage_answer_questions(
                     "plan":            plan,
                     "n_nodes":         all_node_counts[i],
                     "frame_timestamps": all_frame_ts[i],
-                    "context_text":    ctx_text,
+                    "context_text":    all_context_texts[i],
                     "answerer_system": _ANSWERER_SYSTEM,
-                    "answerer_raw_output": raw,
-                    "predicted_answer": answer,
+                    "answerer_raw_output": "\n---BATCH---\n".join(batch_raws),
+                    "predicted_answer": final_answer,
+                    "batch_answers":   batch_answers,
+                    "n_batches":       len(batches),
                 },
             )
 
         results.append(AnswerResult(
-            answer=answer,
+            answer=final_answer,
             intents=[plan.get("reasoning", "")],
             subgraph_size=all_node_counts[i],
             keyframes_used=all_frame_ts[i],
