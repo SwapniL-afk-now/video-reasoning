@@ -61,6 +61,10 @@ def main():
                         help="Path to .srt/.vtt subtitle track (auto-discovered next "
                              "to the video if omitted) — authoritative text for "
                              "text-referred questions")
+    parser.add_argument("--phase",          choices=["all", "siglip", "llm"], default="all",
+                        help="all: full pipeline (default); "
+                             "siglip: Steps 1+2+2b only (parallel-safe, no vLLM); "
+                             "llm: Steps 0+3-10 only (requires siglip phase done first)")
     args = parser.parse_args()
 
     video_filename = os.path.basename(args.video)
@@ -76,19 +80,21 @@ def main():
     print("Loading SigLIP encoder...")
     siglip = build_siglip_encoder()
 
-    print("Preparing Qwen VLM (vLLM engine loads lazily on first use)...")
-    llm = build_llm(
-        model=args.model,
-        tensor_parallel_size=args.tp,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        min_pixels=args.min_pixels,
-        max_pixels=args.max_pixels,
-        lazy=True,
-    )
+    llm = None
+    if args.phase in ("all", "llm"):
+        print("Preparing Qwen VLM (vLLM engine loads lazily on first use)...")
+        llm = build_llm(
+            model=args.model,
+            tensor_parallel_size=args.tp,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            max_model_len=args.max_model_len,
+            min_pixels=args.min_pixels,
+            max_pixels=args.max_pixels,
+            lazy=True,
+        )
 
     whisper_model = None
-    if not args.no_whisper:
+    if args.phase in ("all", "siglip") and not args.no_whisper:
         print(f"Loading Whisper {args.whisper_model}...")
         try:
             from faster_whisper import WhisperModel
@@ -118,11 +124,14 @@ def main():
 
     from qvkg.builder import VKGBuilder
     builder = VKGBuilder(llm, whisper_model, siglip, config)
-    graph   = builder.build(args.video, output_dir)
+    graph   = builder.build(args.video, output_dir, phase=args.phase)
 
-    print(f"\nDone. VKG saved to {output_dir}/vkg.json")
-    print(f"Nodes: {len(graph.nodes)}")
-    print(f"Edges: {sum(len(v) for v in graph.edges.values())}")
+    if graph is not None:
+        print(f"\nDone. VKG saved to {output_dir}/vkg.json")
+        print(f"Nodes: {len(graph.nodes)}")
+        print(f"Edges: {sum(len(v) for v in graph.edges.values())}")
+    else:
+        print(f"\nSigLIP phase done. Checkpoints saved to {output_dir}/")
 
 
 if __name__ == "__main__":

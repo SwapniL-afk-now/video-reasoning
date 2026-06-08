@@ -74,20 +74,40 @@ download_video() {
         >> "$OUT/download_${vid}.log" 2>&1
 }
 
-build_vkg() {
+build_siglip_phase() {
     local vid="$1"
-    if is_vkg_built "$vid"; then
-        log "  [build] VKG already present for $vid, skipping."
+    # Skip if both step1 and step2 already checkpointed
+    if [[ -f "$OUT/$vid/.ckpt_step1_sampled" && -f "$OUT/$vid/.ckpt_step2_transcribed" ]]; then
+        log "  [siglip] $vid already checkpointed, skipping."
         return 0
     fi
-    log "  [build] Building VKG for $vid ..."
+    log "  [siglip] Running SigLIP+Whisper phase for $vid ..."
+    mkdir -p "$OUT/$vid"
     python3 /workspace/qvkg/scripts/build_vkg.py \
         --video "$VIDEOS/$vid.mp4" \
         --out "$OUT" \
         --questions-csv "$CSV" \
         --model "$MODEL" \
         --gpu-memory-utilization "$GPU_UTIL" \
-        2>&1 | tee "$OUT/build_${vid}.log"
+        --phase siglip \
+        >> "$OUT/build_${vid}.log" 2>&1
+}
+
+build_llm_phase() {
+    local vid="$1"
+    if is_vkg_built "$vid"; then
+        log "  [llm] VKG already present for $vid, skipping."
+        return 0
+    fi
+    log "  [llm] Running LLM phase for $vid ..."
+    python3 /workspace/qvkg/scripts/build_vkg.py \
+        --video "$VIDEOS/$vid.mp4" \
+        --out "$OUT" \
+        --questions-csv "$CSV" \
+        --model "$MODEL" \
+        --gpu-memory-utilization "$GPU_UTIL" \
+        --phase llm \
+        2>&1 | tee -a "$OUT/build_${vid}.log"
 }
 
 eval_video() {
@@ -135,8 +155,8 @@ process_video() {
     log "━━━ Processing: $vid ━━━  (free: $(free_gb) GB)"
 
     local BUILD_OK=true
-    if ! build_vkg "$vid"; then
-        log "  [ERROR] build_vkg failed for $vid."
+    if ! build_llm_phase "$vid"; then
+        log "  [ERROR] LLM phase failed for $vid."
         BUILD_OK=false
     fi
 
@@ -187,6 +207,16 @@ log "Already downloaded (process first): ${#ALREADY_HAVE[@]}"
 log "Need download: ${#NEED_DOWNLOAD[@]}"
 
 # ─── Phase 1: Already-downloaded videos ───────────────────────────────────────
+# Run SigLIP phase for all in parallel, then LLM+eval sequentially.
+if [[ ${#ALREADY_HAVE[@]} -gt 0 ]]; then
+    log "--- SigLIP phase for ${#ALREADY_HAVE[@]} already-downloaded videos (parallel) ---"
+    for vid in "${ALREADY_HAVE[@]}"; do
+        build_siglip_phase "$vid" &
+    done
+    wait
+    log "--- SigLIP phase complete ---"
+fi
+
 for vid in "${ALREADY_HAVE[@]}"; do
     process_video "$vid"
 done
@@ -218,7 +248,15 @@ while (( i < N )); do
     wait
     log "  Batch downloads complete."
 
-    # Process each video in the batch sequentially
+    # SigLIP phase for all downloaded videos in parallel
+    log "  Running SigLIP phase in parallel for downloaded videos..."
+    for vid in "${batch[@]}"; do
+        [[ -f "$VIDEOS/$vid.mp4" ]] && build_siglip_phase "$vid" &
+    done
+    wait
+    log "  SigLIP phase complete."
+
+    # LLM phase + eval + cleanup — sequential (single GPU)
     for vid in "${batch[@]}"; do
         if [[ ! -f "$VIDEOS/$vid.mp4" ]]; then
             log "  [ERROR] $vid.mp4 missing after download. Skipping."

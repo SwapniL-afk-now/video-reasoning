@@ -75,13 +75,128 @@ class VKGBuilder:
         except Exception as e:
             raise RuntimeError(f"Whisper transcription failed: {e}")
 
-    def build(self, video_path: str, output_dir: str) -> VKGraph:
+    def build(self, video_path: str, output_dir: str, phase: str = "all"):
+        """Build the VKG.
+
+        phase='all'    — full pipeline (default)
+        phase='siglip' — Steps 1+2+2b only (SigLIP + Whisper, no vLLM); returns None
+        phase='llm'    — Steps 0+3-10 only (vLLM); assumes siglip phase already ran
+        """
         os.makedirs(output_dir, exist_ok=True)
         graph = VKGraph()
         frame_store = FrameStore(output_dir)
 
         # ------------------------------------------------------------------
+        # Steps 1 + 2 + 2b  (SigLIP + Whisper — no vLLM required)
+        # Runs in 'all' and 'siglip' phases.
+        # ------------------------------------------------------------------
+        if phase in ("all", "siglip"):
+            # Pre-launch Whisper in background thread — overlaps with Step 1
+            whisper_future = None
+            step1_cached = _is_checkpoint(output_dir, "step1_sampled")
+            step2_cached = _is_checkpoint(output_dir, "step2_transcribed")
+            if not step2_cached and self.whisper is not None:
+                pool = ThreadPoolExecutor(max_workers=1)
+                whisper_future = pool.submit(self._transcribe_background, video_path)
+
+            # Step 1: Hierarchical frame sampling
+            sample = _read_pickle(output_dir, "sample.pkl")
+            if step1_cached and sample is not None:
+                print("Step 1: Hierarchical frame sampling [CACHED]")
+                print(f"  Loaded {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
+            else:
+                print("Step 1: Hierarchical frame sampling...")
+                sampler = HierarchicalSampler(self.siglip)
+                sample = sampler.sample(
+                    video_path,
+                    budget=self.config.get("frame_budget", 500),
+                    hard_thresh=self.config.get("hard_boundary_thresh", 0.75),
+                    soft_thresh=self.config.get("soft_boundary_thresh", 0.5),
+                )
+
+                question_time_refs = self.config.get("question_time_refs", [])
+                if question_time_refs:
+                    print(f"  Question-aware pre-sampling: {len(question_time_refs)} windows...")
+                    motion_rank = self.config.get("video_type", "") in ("sport", "live")
+                    qs_frames = sampler.sample_question_windows(
+                        video_path, question_time_refs, fps=5.0, motion_rank=motion_rank
+                    )
+                    existing_ts = {round(f.timestamp, 1) for f in sample.keyframes}
+                    new_frames = [f for f in qs_frames
+                                  if round(f.timestamp, 1) not in existing_ts]
+                    sample.keyframes.extend(new_frames)
+                    sample.keyframes.sort(key=lambda f: f.timestamp)
+                    print(f"  Added {len(new_frames)} question-seeded keyframes "
+                          f"→ total {len(sample.keyframes)}")
+
+                frame_store.save_keyframes(sample.keyframes)
+                _write_pickle(output_dir, "sample.pkl", sample)
+                _write_checkpoint(output_dir, "step1_sampled")
+                print(f"  Saved {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
+
+            # Step 2: Audio transcription
+            speech_nodes = _read_pickle(output_dir, "speech_nodes.pkl")
+            if _is_checkpoint(output_dir, "step2_transcribed") and speech_nodes is not None:
+                print(f"Step 2: Audio transcription [CACHED] ({len(speech_nodes)} segments)")
+                graph.add_nodes(speech_nodes)
+            else:
+                print("Step 2: Audio transcription (Whisper)...")
+                speech_nodes = []
+                try:
+                    if whisper_future is not None:
+                        segments = whisper_future.result()
+                    elif self.whisper is not None:
+                        segments, _ = self.whisper.transcribe(
+                            video_path, word_timestamps=False
+                        )
+                        segments = list(segments)
+                    else:
+                        segments = None
+
+                    if segments:
+                        speech_nodes = self._build_speech_nodes(segments)
+                        graph.add_nodes(speech_nodes)
+                        _write_pickle(output_dir, "speech_nodes.pkl", speech_nodes)
+                        _write_checkpoint(output_dir, "step2_transcribed")
+                        print(f"  Transcribed {len(speech_nodes)} speech segments")
+                except Exception as e:
+                    print(f"  Whisper failed: {e} — skipping audio")
+
+            # Step 2b: Subtitle-track ingestion
+            subtitle_nodes = _read_pickle(output_dir, "subtitle_nodes.pkl")
+            if _is_checkpoint(output_dir, "step2b_subtitles") and subtitle_nodes is not None:
+                print(f"Step 2b: Subtitle ingestion [CACHED] ({len(subtitle_nodes)} cues)")
+                graph.add_nodes(subtitle_nodes)
+            else:
+                subtitle_nodes = []
+                sub_path = (self.config.get("subtitle_path")
+                            or discover_subtitle_path(video_path))
+                if sub_path:
+                    print(f"Step 2b: Subtitle ingestion ({os.path.basename(sub_path)})...")
+                    try:
+                        segments = parse_subtitle_file(sub_path)
+                        subtitle_nodes = self._build_subtitle_nodes(segments)
+                        graph.add_nodes(subtitle_nodes)
+                        _write_pickle(output_dir, "subtitle_nodes.pkl", subtitle_nodes)
+                        _write_checkpoint(output_dir, "step2b_subtitles")
+                        print(f"  Ingested {len(subtitle_nodes)} subtitle cues")
+                    except Exception as e:
+                        print(f"  Subtitle ingestion failed: {e} — skipping")
+                else:
+                    print("Step 2b: Subtitle ingestion — no subtitle track found, skipping")
+            speech_nodes = (speech_nodes or []) + (subtitle_nodes or [])
+
+            if phase == "siglip":
+                print("SigLIP phase complete — checkpoints saved.")
+                return None
+
+        # ------------------------------------------------------------------
         # Step 0: Video type detection (skip if already set in config)
+        # Runs in 'all' and 'llm' phases.
+        # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Step 0: Video type detection
+        # Runs in 'all' and 'llm' phases (needs vLLM).
         # ------------------------------------------------------------------
         if "video_type" not in self.config or not self.config["video_type"]:
             if _is_checkpoint(output_dir, "step0_videotype"):
@@ -101,110 +216,19 @@ class VKGBuilder:
         else:
             print(f"Step 0: Video type set by config → {self.config['video_type']}")
 
-        # Pre-launch Whisper in background thread — overlaps with Step 1
-        whisper_future = None
-        step1_cached = _is_checkpoint(output_dir, "step1_sampled")
-        step2_cached = _is_checkpoint(output_dir, "step2_transcribed")
-        if not step2_cached and self.whisper is not None:
-            pool = ThreadPoolExecutor(max_workers=1)
-            whisper_future = pool.submit(self._transcribe_background, video_path)
-
-        # ------------------------------------------------------------------
-        # Step 1: Hierarchical frame sampling
-        # ------------------------------------------------------------------
-        sample = _read_pickle(output_dir, "sample.pkl")
-        if step1_cached and sample is not None:
-            print("Step 1: Hierarchical frame sampling [CACHED]")
-            print(f"  Loaded {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
-        else:
-            print("Step 1: Hierarchical frame sampling...")
-            sampler = HierarchicalSampler(self.siglip)
-            sample = sampler.sample(
-                video_path,
-                budget=self.config.get("frame_budget", 500),
-                hard_thresh=self.config.get("hard_boundary_thresh", 0.75),
-                soft_thresh=self.config.get("soft_boundary_thresh", 0.5),
-            )
-
-            # Question-aware dense pre-sampling (merges into keyframe list)
-            question_time_refs = self.config.get("question_time_refs", [])
-            if question_time_refs:
-                print(f"  Question-aware pre-sampling: {len(question_time_refs)} windows...")
-                motion_rank = self.config.get("video_type", "") in ("sport", "live")
-                qs_frames = sampler.sample_question_windows(
-                    video_path, question_time_refs, fps=5.0, motion_rank=motion_rank
+        # In 'llm' phase, load step1/2 results from checkpoints written by siglip phase.
+        if phase == "llm":
+            sample = _read_pickle(output_dir, "sample.pkl")
+            if sample is None:
+                raise RuntimeError(
+                    f"llm phase requires step1 checkpoint — run siglip phase first for {video_path}"
                 )
-                existing_ts = {round(f.timestamp, 1) for f in sample.keyframes}
-                new_frames = [f for f in qs_frames
-                              if round(f.timestamp, 1) not in existing_ts]
-                sample.keyframes.extend(new_frames)
-                sample.keyframes.sort(key=lambda f: f.timestamp)
-                print(f"  Added {len(new_frames)} question-seeded keyframes "
-                      f"→ total {len(sample.keyframes)}")
-
-            frame_store.save_keyframes(sample.keyframes)
-            _write_pickle(output_dir, "sample.pkl", sample)
-            _write_checkpoint(output_dir, "step1_sampled")
-            print(f"  Saved {len(sample.keyframes)} keyframes, {len(sample.scenes)} scenes")
-
-        # ------------------------------------------------------------------
-        # Step 2: Audio transcription (collect background result if launched)
-        # ------------------------------------------------------------------
-        speech_nodes = _read_pickle(output_dir, "speech_nodes.pkl")
-        if _is_checkpoint(output_dir, "step2_transcribed") and speech_nodes is not None:
-            print(f"Step 2: Audio transcription [CACHED] ({len(speech_nodes)} segments)")
+            print(f"Step 1: Hierarchical frame sampling [CACHED from siglip phase] "
+                  f"({len(sample.keyframes)} keyframes)")
+            speech_nodes = _read_pickle(output_dir, "speech_nodes.pkl") or []
+            subtitle_nodes = _read_pickle(output_dir, "subtitle_nodes.pkl") or []
+            speech_nodes = speech_nodes + subtitle_nodes
             graph.add_nodes(speech_nodes)
-        else:
-            print("Step 2: Audio transcription (Whisper)...")
-            speech_nodes = []
-            try:
-                if whisper_future is not None:
-                    segments = whisper_future.result()
-                elif self.whisper is not None:
-                    # Step 1 was cached — no background thread, run now
-                    segments, _ = self.whisper.transcribe(
-                        video_path, word_timestamps=False
-                    )
-                    segments = list(segments)
-                else:
-                    segments = None
-
-                if segments:
-                    speech_nodes = self._build_speech_nodes(segments)
-                    graph.add_nodes(speech_nodes)
-                    _write_pickle(output_dir, "speech_nodes.pkl", speech_nodes)
-                    _write_checkpoint(output_dir, "step2_transcribed")
-                    print(f"  Transcribed {len(speech_nodes)} speech segments")
-            except Exception as e:
-                print(f"  Whisper failed: {e} — skipping audio")
-
-        # ------------------------------------------------------------------
-        # Step 2b: Subtitle-track ingestion (authoritative text for T* queries)
-        # ------------------------------------------------------------------
-        subtitle_nodes = _read_pickle(output_dir, "subtitle_nodes.pkl")
-        if _is_checkpoint(output_dir, "step2b_subtitles") and subtitle_nodes is not None:
-            print(f"Step 2b: Subtitle ingestion [CACHED] ({len(subtitle_nodes)} cues)")
-            graph.add_nodes(subtitle_nodes)
-        else:
-            subtitle_nodes = []
-            sub_path = (self.config.get("subtitle_path")
-                        or discover_subtitle_path(video_path))
-            if sub_path:
-                print(f"Step 2b: Subtitle ingestion ({os.path.basename(sub_path)})...")
-                try:
-                    segments = parse_subtitle_file(sub_path)
-                    subtitle_nodes = self._build_subtitle_nodes(segments)
-                    graph.add_nodes(subtitle_nodes)
-                    _write_pickle(output_dir, "subtitle_nodes.pkl", subtitle_nodes)
-                    _write_checkpoint(output_dir, "step2b_subtitles")
-                    print(f"  Ingested {len(subtitle_nodes)} subtitle cues")
-                except Exception as e:
-                    print(f"  Subtitle ingestion failed: {e} — skipping")
-            else:
-                print("Step 2b: Subtitle ingestion — no subtitle track found, skipping")
-        # Subtitle nodes are SpeechNodes; fold them into speech_nodes so the
-        # cached-graph re-add path below covers them too.
-        speech_nodes = (speech_nodes or []) + (subtitle_nodes or [])
 
         # ------------------------------------------------------------------
         # Step 3: Scene extraction
