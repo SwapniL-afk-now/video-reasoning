@@ -148,6 +148,15 @@ def _assemble_context(
 ) -> tuple:
     """Returns (content_list, node_count, frame_timestamps)."""
 
+    # --- Adaptive frame budget based on question type ---
+    # Entity recognition / visual questions need denser frame sampling
+    _entity_rec_types = {"entity recognition", "key information retrieval"}
+    qtypes_lower = {qt.strip().lower() for qt in (question_type or [])}
+    if qtypes_lower & _entity_rec_types:
+        frame_budget = 12   # denser for visual/OCR questions
+    else:
+        frame_budget = MAX_FRAMES
+
     # --- Graph nodes ---
     seen_ids = set()
     all_nodes = []
@@ -155,13 +164,16 @@ def _assemble_context(
     SKIP_TYPES = {"EpisodeNode", "VideoNode"}
 
     def _add_nodes_in_range(t_start: float, t_end: float, max_nodes: int = 30) -> None:
-        """Directly fetch graph nodes that START in [t_start, t_end] and append to all_nodes.
-        Uses t_start-based filter (not span) so video-wide CharacterNodes are excluded."""
+        """Fetch graph nodes that overlap [t_start, t_end] and append to all_nodes.
+        Uses span-overlap filter so ongoing speech/action nodes that START before
+        the window but extend into it are included (e.g. a sentence starting 2s
+        before the window and ending inside it)."""
         buf = 5.0
+        lo, hi = t_start - buf, t_end + buf
         window_nodes = [
             n for n in executor.graph.nodes.values()
-            if (n.t_start >= t_start - buf
-                and n.t_start <= t_end + buf
+            if (n.t_end >= lo
+                and n.t_start <= hi
                 and n.node_type not in SKIP_TYPES
                 and n.id not in seen_ids)
         ]
@@ -217,6 +229,42 @@ def _assemble_context(
                     if node and nid not in seen_ids:
                         seen_ids.add(nid)
                         all_nodes.append(node)
+
+    # Fix: Entity-introduction expansion — for each MCQ option, find if it matches
+    # a CharacterNode or entity in the graph, then include that entity's earliest
+    # appearance (introduction point) plus surrounding context. This ensures that
+    # when a question references an entity (e.g. "Sierra's roommate"), the entity's
+    # name and role are available even if stated before the time-reference window.
+    for opt_text in _mcq_opts[:4]:
+        opt_text = opt_text.strip()
+        if len(opt_text) < 3:
+            continue
+        opt_lower = opt_text.lower()
+        # Check if option matches any CharacterNode label or entity_id
+        for char_node in executor.graph.get_nodes_by_type("CharacterNode"):
+            char_label = (char_node.label or "").lower()
+            char_desc = (char_node.canonical_description or "").lower()
+            char_id = (char_node.entity_id or "").lower()
+            if (opt_lower in char_label or opt_lower in char_desc
+                    or opt_lower in char_id or char_label in opt_lower):
+                # Found a matching entity — get its earliest appearance
+                appearances = executor.graph.entity_idx.get(char_node.entity_id, [])
+                earliest_node = None
+                for aid in appearances:
+                    anode = executor.graph.nodes.get(aid)
+                    if anode and (earliest_node is None or anode.t_start < earliest_node.t_start):
+                        earliest_node = anode
+                if earliest_node and earliest_node.id not in seen_ids:
+                    _add_nodes_in_range(
+                        earliest_node.t_start - 10,
+                        earliest_node.t_start + 30,
+                        max_nodes=10,
+                    )
+                # Also include the CharacterNode itself
+                if char_node.id not in seen_ids:
+                    seen_ids.add(char_node.id)
+                    all_nodes.append(char_node)
+                break
 
     for w in plan.get("windows", []):
         _add_nodes_in_range(float(w["t_start"]), float(w["t_end"]))
@@ -302,7 +350,7 @@ def _assemble_context(
     if video_path:
         seen_buckets: set = set()
         for node in ranked_search_nodes[:20]:
-            if len(all_frames) >= MAX_FRAMES:
+            if len(all_frames) >= frame_budget:
                 break
             if node.node_type not in _VISUAL_TYPES:
                 continue
@@ -319,7 +367,7 @@ def _assemble_context(
     # Also extract from planner-identified windows if frames needed
     if plan.get("needs_frames") and video_path:
         for w in plan.get("windows", []):
-            if len(all_frames) >= MAX_FRAMES:
+            if len(all_frames) >= frame_budget:
                 break
             frames = extract_frames_for_window(
                 video_path, float(w["t_start"]), float(w["t_end"]),
@@ -328,7 +376,7 @@ def _assemble_context(
             all_frames.extend(frames)
 
     # Cap total frames
-    all_frames = all_frames[:MAX_FRAMES]
+    all_frames = all_frames[:frame_budget]
     b64_urls = frames_to_b64_urls(all_frames)
     frame_ts = [f.timestamp for f in all_frames]
 

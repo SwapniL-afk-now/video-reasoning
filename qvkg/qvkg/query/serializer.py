@@ -157,7 +157,7 @@ class ContextSerializer:
                         + (f" — {summary[:100]}" if summary else "")
                     )
 
-        # Dialogue
+        # Dialogue — emit with speaker labels from graph edges
         speeches = subgraph.get_speech_nodes()
         if speeches:
             sections.append("\n## Dialogue")
@@ -167,7 +167,7 @@ class ContextSerializer:
                     char = subgraph.nodes.get(edge.target_id)
                     if char:
                         spoken_by[edge.source_id] = char.label[:30]
-            for s in speeches[:12]:
+            for s in speeches[:15]:
                 speaker = spoken_by.get(s.id, "")
                 speaker_str = f"{speaker}: " if speaker else ""
                 sections.append(f'  [{s.t_start:.0f}s] {speaker_str}"{s.label}"')
