@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# run_rolling.sh — Rolling download → build VKG → eval → delete pipeline
-# Processes all 103 LVBench videos with limited disk space.
+# run_rolling.sh — Batch download → build VKG → eval → delete pipeline
+# Downloads BATCH_SIZE videos in parallel, processes them one by one on GPU,
+# deletes everything after eval (keeps only results_all.jsonl).
 # Idempotent: safe to kill and restart at any point.
 
 set -euo pipefail
@@ -14,6 +15,7 @@ DONE_FILE="$OUT/done_videos.txt"
 MODEL="Qwen/Qwen3.5-4B"
 GPU_UTIL=0.70
 LOG="$OUT/run_rolling.log"
+BATCH_SIZE=8   # parallel downloads per batch
 
 # Videos currently being processed by run_timed.sh — never touch these
 IN_PROGRESS=("KktLi3UifPY" "JTa_Ue2MSwc")
@@ -104,9 +106,11 @@ eval_video() {
 
 cleanup_video() {
     local vid="$1"
-    log "  [cleanup] Removing $vid.mp4 and VKG dir ..."
-    rm -f "$VIDEOS/$vid.mp4"
+    log "  [cleanup] Removing all artifacts for $vid ..."
+    rm -f  "$VIDEOS/$vid.mp4"
     rm -rf "$OUT/$vid"
+    rm -f  "$OUT/build_${vid}.log" "$OUT/eval_${vid}.log" "$OUT/download_${vid}.log"
+    rm -rf "$OUT/debug_${vid}"
 }
 
 free_gb() { df -BG /workspace | awk 'NR==2{gsub("G",""); print $4}'; }
@@ -156,7 +160,7 @@ process_video() {
 mkdir -p "$OUT" "$VIDEOS"
 touch "$DONE_FILE"
 log "=== run_rolling.sh starting ==="
-log "Free disk: $(free_gb) GB"
+log "Free disk: $(free_gb) GB  |  batch_size=$BATCH_SIZE"
 
 declare -A SKIP
 for v in "${IN_PROGRESS[@]}"; do SKIP["$v"]=1; done
@@ -187,58 +191,42 @@ for vid in "${ALREADY_HAVE[@]}"; do
     process_video "$vid"
 done
 
-# ─── Phase 2: Remaining videos with prefetch overlap ─────────────────────────
-PREFETCH_PID=""
-PREFETCH_VID=""
+# ─── Phase 2: Batch download → process → delete ───────────────────────────────
 N="${#NEED_DOWNLOAD[@]}"
+i=0
 
-for (( i=0; i<N; i++ )); do
-    vid="${NEED_DOWNLOAD[$i]}"
+while (( i < N )); do
+    # Disk guard: cap effective batch size by available space (~2 GB per video)
+    disk_now=$(free_gb)
+    max_by_disk=$(( disk_now / 3 ))
+    (( max_by_disk < 1 )) && max_by_disk=1
+    effective=$(( BATCH_SIZE < max_by_disk ? BATCH_SIZE : max_by_disk ))
 
-    # Wait for prefetch if it was for this video
-    if [[ -n "$PREFETCH_PID" && "$PREFETCH_VID" == "$vid" ]]; then
-        log "  [prefetch] Waiting for background download of $vid (pid $PREFETCH_PID)..."
-        if wait "$PREFETCH_PID"; then
-            log "  [prefetch] Download of $vid complete."
-        else
-            log "  [WARNING] Background download of $vid failed. Retrying synchronously..."
-            if ! download_video "$vid"; then
-                log "  [ERROR] Download of $vid failed. Skipping."
-                PREFETCH_PID=""; PREFETCH_VID=""
-                continue
-            fi
-        fi
-        PREFETCH_PID=""; PREFETCH_VID=""
-    else
-        # No prefetch for this vid — download synchronously
-        if ! download_video "$vid"; then
-            log "  [ERROR] Download of $vid failed. Skipping."
+    # Slice next batch
+    batch=()
+    for (( j=i; j<N && j<i+effective; j++ )); do
+        batch+=("${NEED_DOWNLOAD[$j]}")
+    done
+    i=$(( i + ${#batch[@]} ))
+
+    log "─── Batch $((i / effective)) / $(( (N + effective - 1) / effective )) — downloading ${#batch[@]} videos in parallel ───"
+
+    # Download all in parallel
+    for vid in "${batch[@]}"; do
+        download_video "$vid" &
+    done
+    wait
+    log "  Batch downloads complete."
+
+    # Process each video in the batch sequentially
+    for vid in "${batch[@]}"; do
+        if [[ ! -f "$VIDEOS/$vid.mp4" ]]; then
+            log "  [ERROR] $vid.mp4 missing after download. Skipping."
             continue
         fi
-    fi
-
-    [[ -f "$VIDEOS/$vid.mp4" ]] || { log "  [ERROR] $vid.mp4 missing after download. Skipping."; continue; }
-
-    # Kick off prefetch for next video BEFORE GPU work starts
-    if (( i+1 < N )); then
-        next_vid="${NEED_DOWNLOAD[$((i+1))]}"
-        disk_now=$(free_gb)
-        if (( disk_now > 8 )); then
-            log "  [prefetch] Background download of $next_vid (free: ${disk_now} GB)..."
-            download_video "$next_vid" &
-            PREFETCH_PID=$!
-            PREFETCH_VID="$next_vid"
-        else
-            log "  [prefetch] Low disk (${disk_now} GB), skipping prefetch of $next_vid."
-            PREFETCH_PID=""; PREFETCH_VID=""
-        fi
-    fi
-
-    process_video "$vid"
+        process_video "$vid"
+    done
 done
-
-# Reap any dangling prefetch
-[[ -n "$PREFETCH_PID" ]] && { wait "$PREFETCH_PID" || true; }
 
 # ─── Final summary ────────────────────────────────────────────────────────────
 log "=== run_rolling.sh complete ==="
