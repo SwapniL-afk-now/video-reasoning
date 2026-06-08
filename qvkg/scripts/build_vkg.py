@@ -131,7 +131,14 @@ def main():
         print(f"Nodes: {len(graph.nodes)}")
         print(f"Edges: {sum(len(v) for v in graph.edges.values())}")
     else:
-        print(f"\nSigLIP phase done. Checkpoints saved to {output_dir}/")
+        # Explicitly release GPU memory before process exits so vLLM can claim it.
+        import gc
+        import torch
+        del builder, siglip, whisper_model
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        print(f"\nSigLIP phase done. GPU memory released. Checkpoints saved to {output_dir}/")
 
 
 if __name__ == "__main__":

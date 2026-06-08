@@ -24,6 +24,17 @@ IN_PROGRESS=("KktLi3UifPY" "JTa_Ue2MSwc")
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
+wait_gpu_free() {
+    log "  [gpu] Waiting for GPU memory to free up (>80 GB) before vLLM..."
+    until python3 -c "
+import subprocess, sys
+r = subprocess.run(['nvidia-smi','--query-gpu=memory.free','--format=csv,noheader,nounits'], capture_output=True, text=True)
+free_mib = int(r.stdout.strip())
+sys.exit(0 if free_mib > 81920 else 1)
+" 2>/dev/null; do sleep 3; done
+    log "  [gpu] GPU ready."
+}
+
 get_all_vids() {
     python3 -c "
 import csv
@@ -215,6 +226,7 @@ if [[ ${#ALREADY_HAVE[@]} -gt 0 ]]; then
     done
     wait
     log "--- SigLIP phase complete ---"
+    wait_gpu_free
 fi
 
 for vid in "${ALREADY_HAVE[@]}"; do
@@ -255,6 +267,7 @@ while (( i < N )); do
     done
     wait
     log "  SigLIP phase complete."
+    wait_gpu_free
 
     # LLM phase + eval + cleanup — sequential (single GPU)
     for vid in "${batch[@]}"; do
