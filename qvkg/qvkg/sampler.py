@@ -30,7 +30,7 @@ class HierarchicalSampler:
         if not coarse:
             return SampleResult([], [], [])
 
-        print(f"  Extracted {len(coarse)} coarse frames at ~1fps")
+        print(f"  Extracted {len(coarse)} coarse frames at ~3fps")
         siglip_embs = self._siglip_batch(coarse)
         scores = self._score_all(coarse, audio_rms, siglip_embs)
         boundaries = self._detect_boundaries(coarse, scores, hard_thresh, soft_thresh,
@@ -122,7 +122,7 @@ class HierarchicalSampler:
         return sorted(all_frames, key=lambda f: f.timestamp)
 
     def _extract_coarse_frames(
-        self, video_path: str, target_fps: float = 1.0
+        self, video_path: str, target_fps: float = 3.0
     ) -> Tuple[List[FrameInfo], float, np.ndarray]:
         frames: List[FrameInfo] = []
         container = av.open(video_path)
@@ -194,8 +194,13 @@ class HierarchicalSampler:
         motion = self._optical_flow_mag(prev_img, curr_img)
         ts = int(frames[i].timestamp)
         audio_e = float(audio_rms[min(ts, len(audio_rms) - 1)])
+        text_s = self._text_region_score(curr_img)
 
-        return 0.30 * hist_d + 0.30 * sem_d + 0.20 * motion + 0.20 * audio_e
+        # Text presence is weighted so frames bearing on-screen captions / name
+        # lower-thirds are retained as keyframes and reach the OCR/VLM stage —
+        # otherwise short captions (e.g. a guest's name) never enter the graph.
+        return (0.25 * hist_d + 0.25 * sem_d + 0.15 * motion
+                + 0.15 * audio_e + 0.20 * text_s)
 
     def _score_all(
         self, frames: List[FrameInfo], audio_rms: np.ndarray,
@@ -246,6 +251,42 @@ class HierarchicalSampler:
                              [8, 8, 8], [0, 256, 0, 256, 0, 256])
             return cv2.normalize(h, h).flatten()
         return float(cv2.compareHist(hist(a), hist(b), cv2.HISTCMP_BHATTACHARYYA))
+
+    def _text_region_score(self, img: np.ndarray) -> float:
+        """Heuristic on-screen-text density (0–1), biased to the lower third.
+
+        Gradient → Otsu → horizontal morphological close groups character strokes
+        into line-shaped blobs; wide/short blobs of moderate size are counted as
+        text. Captions/lower-thirds (bottom 40%) are up-weighted. Cheap enough to
+        run per coarse (~1fps) frame; returns 0.0 on any failure."""
+        try:
+            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            h, w = gray.shape
+            scale = 320.0 / max(1, w)
+            if scale < 1.0:
+                gray = cv2.resize(gray, (int(w * scale), int(h * scale)))
+            H, W = gray.shape
+
+            grad = np.absolute(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3))
+            grad = cv2.normalize(grad, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            _, bw = cv2.threshold(grad, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 3))
+            closed = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+            contours, _ = cv2.findContours(
+                closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            text_area = 0.0
+            for c in contours:
+                x, y, cw, ch = cv2.boundingRect(c)
+                aspect = cw / max(1, ch)
+                area = cw * ch
+                if (aspect >= 2.5 and 6 <= ch <= 0.20 * H
+                        and area >= 0.0008 * H * W):
+                    weight = 1.5 if y >= 0.60 * H else 1.0  # favour lower-thirds
+                    text_area += area * weight
+            return min(1.0, (text_area / float(H * W)) * 6.0)
+        except Exception:
+            return 0.0
 
     def _optical_flow_mag(self, prev: np.ndarray, curr: np.ndarray) -> float:
         try:

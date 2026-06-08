@@ -63,29 +63,34 @@ class LLMEntityResolver:
             for i in range(0, len(desc_lines), self.BATCH_SIZE)
         ]
 
+        # Submit every chunk in a single batched llm.chat so vLLM processes them
+        # concurrently (continuous batching) rather than one blocking call each.
+        batch_messages = [
+            [
+                {"role": "system", "content": ENTITY_RESOLUTION_SYSTEM_PROMPT},
+                {"role": "user", "content": (
+                    f"Video type: {video_type or 'unknown'}\n"
+                    f"Total character mentions to resolve: {len(batch)}\n\n"
+                    "Character descriptions (format: [timestamp, scene_id] description):\n"
+                    + "\n".join(batch)
+                    + "\n\nGroup these into canonical entities. "
+                      "Return one entry per unique real-world person."
+                )},
+            ]
+            for batch in batches
+        ]
+
         all_entities: List[dict] = []
-        for batch in batches:
-            user_content = (
-                f"Video type: {video_type or 'unknown'}\n"
-                f"Total character mentions to resolve: {len(batch)}\n\n"
-                "Character descriptions (format: [timestamp, scene_id] description):\n"
-                + "\n".join(batch)
-                + "\n\nGroup these into canonical entities. "
-                  "Return one entry per unique real-world person."
+        try:
+            outputs = llm.chat(
+                messages=batch_messages,
+                sampling_params=ENTITY_RESOLUTION_SAMPLING,
             )
-            try:
-                outputs = llm.chat(
-                    messages=[[
-                        {"role": "system", "content": ENTITY_RESOLUTION_SYSTEM_PROMPT},
-                        {"role": "user",   "content": user_content},
-                    ]],
-                    sampling_params=ENTITY_RESOLUTION_SAMPLING,
-                )
-                batch_entities = json.loads(outputs[0].outputs[0].text)
-                all_entities.extend(batch_entities)
-            except Exception as e:
-                print(f"  LLM entity resolution failed for batch: {e}")
-                return None  # triggers fallback in caller
+            for out in outputs:
+                all_entities.extend(json.loads(out.outputs[0].text))
+        except Exception as e:
+            print(f"  LLM entity resolution failed: {e}")
+            return None  # triggers fallback in caller
 
         if not all_entities:
             return None

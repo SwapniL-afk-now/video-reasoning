@@ -23,10 +23,16 @@ build.log
 .claude/
 
 # Large dataset / media files
-KktLi3UifPY.mp4
+*.mp4
+*.m4a
+*.part
+videos/
+output_4b/
+download_lvbench.log
+download_lvbench_parallel.log
+*.out
 KktLi3UifPY_dataset.csv
 KktLi3UifPY_dataset.json
-JTa_Ue2MSwc.mp4
 LVBench_full.csv
 
 # Lock files

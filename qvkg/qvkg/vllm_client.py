@@ -615,6 +615,60 @@ def extract_mcq_answer(text: str) -> str:
 _DEFAULT_MODEL = "Qwen/Qwen3.5-4B"
 
 
+class LazyLLM:
+    """Defers vLLM engine construction until the first real use.
+
+    The engine reserves its full GPU budget the moment it is created. By
+    deferring construction to the first attribute access (e.g. ``.chat``),
+    SigLIP encoding, Whisper transcription and frame sampling all run with the
+    GPU otherwise free — the engine spins up exactly when first needed.
+    Transparent: any attribute/method access proxies to the real ``LLM``.
+    """
+
+    def __init__(self, **kwargs):
+        # Store via __dict__ to avoid triggering __getattr__ during init.
+        self.__dict__["_kwargs"] = kwargs
+        self.__dict__["_llm"] = None
+
+    def _ensure(self) -> LLM:
+        if self.__dict__["_llm"] is None:
+            print("  [vLLM] Initializing engine on first use...")
+            self.__dict__["_llm"] = _construct_llm(**self.__dict__["_kwargs"])
+        return self.__dict__["_llm"]
+
+    @property
+    def is_loaded(self) -> bool:
+        return self.__dict__["_llm"] is not None
+
+    def __getattr__(self, name):
+        # Only called for attributes not found normally → proxy to real engine.
+        return getattr(self._ensure(), name)
+
+
+def _construct_llm(
+    model: str,
+    tensor_parallel_size: int,
+    gpu_memory_utilization: float,
+    max_model_len: int,
+    max_images_per_prompt: int,
+    min_pixels: int,
+    max_pixels: int,
+) -> LLM:
+    return LLM(
+        model=model,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        enable_prefix_caching=True,
+        max_num_seqs=256,
+        max_model_len=max_model_len,
+        limit_mm_per_prompt={"image": max_images_per_prompt},
+        mm_processor_kwargs={
+            "min_pixels": min_pixels,
+            "max_pixels": max_pixels,
+        },
+    )
+
+
 def build_llm(
     model: str = _DEFAULT_MODEL,
     tensor_parallel_size: int = 1,
@@ -623,20 +677,20 @@ def build_llm(
     max_images_per_prompt: int = 10,
     min_pixels: int = 256 * 28 * 28,
     max_pixels: int = 1280 * 28 * 28,
-) -> LLM:
-    return LLM(
+    lazy: bool = False,
+):
+    kwargs = dict(
         model=model,
         tensor_parallel_size=tensor_parallel_size,
         gpu_memory_utilization=gpu_memory_utilization,
-        enable_prefix_caching=True,
-        max_num_seqs=64,
         max_model_len=max_model_len,
-        limit_mm_per_prompt={"image": max_images_per_prompt},
-        mm_processor_kwargs={
-            "min_pixels": min_pixels,
-            "max_pixels": max_pixels,
-        },
+        max_images_per_prompt=max_images_per_prompt,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
     )
+    if lazy:
+        return LazyLLM(**kwargs)
+    return _construct_llm(**kwargs)
 
 
 def build_siglip_encoder(model_name: str = "google/siglip-so400m-patch14-384"):

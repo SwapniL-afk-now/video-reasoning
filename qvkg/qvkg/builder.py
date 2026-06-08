@@ -21,6 +21,7 @@ from .sampler import HierarchicalSampler
 from .schema import (
     Episode, FrameInfo, Scene, VKGEdge, VKGNode, VKGraph,
 )
+from .subtitle import discover_subtitle_path, parse_subtitle_file
 from .vllm_client import CAUSAL_SAMPLING, VIDEO_TYPE_SAMPLING, VIDEO_TYPE_SYSTEM_PROMPT
 
 
@@ -178,6 +179,34 @@ class VKGBuilder:
                 print(f"  Whisper failed: {e} — skipping audio")
 
         # ------------------------------------------------------------------
+        # Step 2b: Subtitle-track ingestion (authoritative text for T* queries)
+        # ------------------------------------------------------------------
+        subtitle_nodes = _read_pickle(output_dir, "subtitle_nodes.pkl")
+        if _is_checkpoint(output_dir, "step2b_subtitles") and subtitle_nodes is not None:
+            print(f"Step 2b: Subtitle ingestion [CACHED] ({len(subtitle_nodes)} cues)")
+            graph.add_nodes(subtitle_nodes)
+        else:
+            subtitle_nodes = []
+            sub_path = (self.config.get("subtitle_path")
+                        or discover_subtitle_path(video_path))
+            if sub_path:
+                print(f"Step 2b: Subtitle ingestion ({os.path.basename(sub_path)})...")
+                try:
+                    segments = parse_subtitle_file(sub_path)
+                    subtitle_nodes = self._build_subtitle_nodes(segments)
+                    graph.add_nodes(subtitle_nodes)
+                    _write_pickle(output_dir, "subtitle_nodes.pkl", subtitle_nodes)
+                    _write_checkpoint(output_dir, "step2b_subtitles")
+                    print(f"  Ingested {len(subtitle_nodes)} subtitle cues")
+                except Exception as e:
+                    print(f"  Subtitle ingestion failed: {e} — skipping")
+            else:
+                print("Step 2b: Subtitle ingestion — no subtitle track found, skipping")
+        # Subtitle nodes are SpeechNodes; fold them into speech_nodes so the
+        # cached-graph re-add path below covers them too.
+        speech_nodes = (speech_nodes or []) + (subtitle_nodes or [])
+
+        # ------------------------------------------------------------------
         # Step 3: Scene extraction
         # ------------------------------------------------------------------
         scene_data = _read_pickle(output_dir, "scene_data.pkl")
@@ -292,6 +321,9 @@ class VKGBuilder:
             print("Step 9: FAISS index [CACHED]")
             from .faiss_index import load_faiss_index
             faiss_index = load_faiss_index(index_path)
+            # Rebuild node_id_list if not persisted (matches build_faiss_index ordering)
+            if not graph.node_id_list:
+                graph.node_id_list = [n.id for n in graph.nodes.values()]
             print(f"  Loaded FAISS HNSW index over {len(graph.node_id_list)} nodes")
         else:
             print("Step 9: FAISS index...")
@@ -393,6 +425,30 @@ class VKGBuilder:
                 metadata={"source": "whisper"},
             )
             nodes.append(node)
+        return nodes
+
+    def _build_subtitle_nodes(self, segments) -> List[VKGNode]:
+        """Turn parsed subtitle cues into SpeechNodes tagged source='subtitle'.
+
+        These carry exact subtitle wording and timing — authoritative for
+        text-referred questions — and are typed as SpeechNodes so existing
+        scene-attribution and cross-modal edge logic picks them up.
+        """
+        nodes = []
+        for seg in segments:
+            text = getattr(seg, "text", "").strip()
+            if not text:
+                continue
+            nodes.append(VKGNode(
+                id=f"sub_{len(nodes):05d}",
+                node_type="SpeechNode",
+                label=text,
+                level=0,
+                t_start=float(getattr(seg, "start", 0)),
+                t_end=float(getattr(seg, "end", 0)),
+                confidence=1.0,
+                metadata={"source": "subtitle"},
+            ))
         return nodes
 
     # ------------------------------------------------------------------

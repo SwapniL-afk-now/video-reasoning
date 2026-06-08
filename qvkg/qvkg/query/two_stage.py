@@ -72,6 +72,12 @@ _ANSWERER_SYSTEM = (
     "You are a video QA assistant. "
     "Study the provided knowledge graph context and video frames carefully, "
     "then answer the question. "
+    "Treat any time window in the question as approximate: the event being asked "
+    "about may begin a few seconds before, or complete a few seconds after, the "
+    "stated range — weigh frames just outside the window rather than dismissing them. "
+    "Take explicit narration and on-screen text literally: if the audio says an action "
+    "is performed (e.g. 'boiled', 'fried') prefer that over your own visual guess about "
+    "an adjacent step. "
     "For multiple-choice questions, output exactly one letter: A, B, C, or D."
 )
 
@@ -150,11 +156,16 @@ def _assemble_context(
     """Returns (content_list, node_count, frame_timestamps)."""
 
     # --- Adaptive frame budget based on question type ---
-    # Entity recognition / visual questions need denser frame sampling
-    _entity_rec_types = {"entity recognition", "key information retrieval"}
+    # Visual/entity/event/temporal questions need denser frame sampling so that
+    # a specific person's appearance/outfit or the order of events across a window
+    # is actually captured (not just a clustered burst at one timestamp).
+    _dense_frame_types = {
+        "entity recognition", "key information retrieval",
+        "event understanding", "temporal grounding",
+    }
     qtypes_lower = {qt.strip().lower() for qt in (question_type or [])}
-    if qtypes_lower & _entity_rec_types:
-        frame_budget = 12   # denser for visual/OCR questions
+    if qtypes_lower & _dense_frame_types:
+        frame_budget = 14   # denser for visual/OCR/event-ordering questions
     else:
         frame_budget = MAX_FRAMES
 
@@ -341,7 +352,14 @@ def _assemble_context(
             t0, t1 = parsed
             frame_t0 = _tr_t0 if _tr_t0 is not None else min(t0, t1)
             frame_t1 = _tr_t1 if _tr_t1 is not None else max(t0, t1)
-            frames = extract_frames_for_window(video_path, frame_t0, frame_t1, max_frames=6)
+            # Scale frame count with window span so a multi-minute window
+            # (e.g. "last to appear during the interview") gets evenly-spaced
+            # coverage instead of a fixed sparse 6. Reserve most of the budget
+            # for the explicitly-referenced window; extract_frames_for_window
+            # already spaces them uniformly across [frame_t0, frame_t1].
+            tr_span = max(0.0, frame_t1 - frame_t0)
+            tr_max = min(frame_budget, max(6, int(tr_span / 12)))
+            frames = extract_frames_for_window(video_path, frame_t0, frame_t1, max_frames=tr_max)
             all_frames.extend(frames)
 
     # Auto-extract from top visual search result nodes.
@@ -449,7 +467,7 @@ def _make_frame_batches(
     batches = []
     step = batch_size - overlap
     for start in range(0, len(b64_urls), step):
-        end = min(start + batch_size, len(b4_urls) if False else len(b64_urls))
+        end = min(start + batch_size, len(b64_urls))
         batch_urls = b64_urls[start:end]
         batch_ts = frame_ts[start:end]
 
@@ -688,48 +706,73 @@ def batch_two_stage_answer_questions(
         all_b64_urls.append(b64_urls)
         all_batches.append(batches)
 
-    # --- Stage 3: batched answerer (per-question, per-batch with context propagation) ---
+    # --- Stage 3: batched answerer (all prompts in one llm.chat call per pass) ---
     sampling = MCQ_REASONING_SAMPLING if mcq else QA_SAMPLING
     results: List[AnswerResult] = []
 
-    for i, (q, plan, batches) in enumerate(zip(questions, plans, all_batches)):
-        batch_answers: List[str] = []
-        batch_raws: List[str] = []
-        prev_answer_hint = ""
+    # Organize prompts by batch index: batch_groups[bi] = [(qi, messages), ...]
+    max_batches = max(len(batches) for batches in all_batches) if all_batches else 0
+    batch_groups: List[List[tuple]] = [[] for _ in range(max_batches)]
 
-        for batch_idx, batch_content in enumerate(batches):
-            # Prepend previous batch's answer as continuity signal
-            if prev_answer_hint:
-                hint_text = (
-                    f"## Previous batch analysis\n"
-                    f"{prev_answer_hint}\n\n"
-                    f"Consider the above when answering. "
-                    f"If the evidence in the current frames conflicts, prefer the current frames."
-                )
-                for ci, item in enumerate(batch_content):
-                    if item.get("type") == "text" and "Question:" in item.get("text", ""):
-                        batch_content[ci] = {"type": "text", "text": hint_text + "\n\n" + item["text"]}
-                        break
-
+    for i, batches in enumerate(all_batches):
+        for bi, batch_content in enumerate(batches):
             messages = [
                 {"role": "system", "content": _ANSWERER_SYSTEM},
                 {"role": "user",   "content": batch_content},
             ]
+            batch_groups[bi].append((i, messages))
 
-            output = llm.chat(
-                messages=[messages],
-                sampling_params=sampling,
-                chat_template_kwargs={"enable_thinking": mcq},
-                use_tqdm=False,
-            )[0]
+    # Process each batch group in one llm.chat() call
+    question_answers: Dict[int, List[tuple]] = {}  # qi -> [(batch_idx, answer, raw)]
 
+    for bi, group in enumerate(batch_groups):
+        if not group:
+            continue
+
+        # For batch_idx > 0, prepend previous batch's answer as hint
+        if bi > 0:
+            for pi, qi in enumerate(group):
+                qi_val = group[pi][0]
+                prev_raw = None
+                for prev_bi, _, raw in question_answers.get(qi_val, []):
+                    if prev_bi == bi - 1:
+                        prev_raw = raw
+                        break
+                if prev_raw:
+                    hint_text = (
+                        f"## Previous batch analysis\n"
+                        f"{prev_raw}\n\n"
+                        f"Consider the above when answering. "
+                        f"If the evidence in the current frames conflicts, prefer the current frames."
+                    )
+                    content = group[pi][1][1]["content"]  # user content
+                    for ci, item in enumerate(content):
+                        if item.get("type") == "text" and "Question:" in item.get("text", ""):
+                            content[ci] = {"type": "text", "text": hint_text + "\n\n" + item["text"]}
+                            break
+
+        prompts = [msgs for _, msgs in group]
+        qi_indices = [qi for qi, _ in group]
+
+        outputs = llm.chat(
+            messages=prompts,
+            sampling_params=sampling,
+            chat_template_kwargs={"enable_thinking": mcq},
+            use_tqdm=False,
+        )
+
+        for qi, output in zip(qi_indices, outputs):
             raw = output.outputs[0].text.strip()
             answer = extract_mcq_answer(raw) if mcq else raw
-            batch_answers.append(answer)
-            batch_raws.append(raw)
-            prev_answer_hint = raw
+            if qi not in question_answers:
+                question_answers[qi] = []
+            question_answers[qi].append((bi, answer, raw))
 
-        # Merge batch answers via majority vote
+    # Merge per-question and build results
+    for i, (q, plan, batches) in enumerate(zip(questions, plans, all_batches)):
+        qa_list = sorted(question_answers.get(i, []), key=lambda x: x[0])
+        batch_answers = [ans for _, ans, _ in qa_list]
+        batch_raws = [raw for _, _, raw in qa_list]
         final_answer = _merge_batch_answers(batch_answers)
 
         if debug_dir:

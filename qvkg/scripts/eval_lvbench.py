@@ -120,7 +120,7 @@ def main():
     from qvkg.vllm_client import build_llm, build_siglip_encoder
     siglip = build_siglip_encoder()
 
-    print(f"Loading {args.model} via vLLM...")
+    print(f"Preparing {args.model} (vLLM engine loads lazily on first use)...")
     llm = build_llm(
         model=args.model,
         tensor_parallel_size=args.tp,
@@ -128,6 +128,7 @@ def main():
         max_model_len=args.max_model_len,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
+        lazy=True,
     )
 
     questions_by_video = load_questions(args.csv)

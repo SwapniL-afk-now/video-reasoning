@@ -57,6 +57,10 @@ def main():
                         help="Minimum pixels per image for VLM processor (default 256*28*28)")
     parser.add_argument("--max-pixels",     type=int, default=1003520,
                         help="Maximum pixels per image for VLM processor (default 1280*28*28)")
+    parser.add_argument("--subtitles",      default=None,
+                        help="Path to .srt/.vtt subtitle track (auto-discovered next "
+                             "to the video if omitted) — authoritative text for "
+                             "text-referred questions")
     args = parser.parse_args()
 
     video_filename = os.path.basename(args.video)
@@ -72,7 +76,7 @@ def main():
     print("Loading SigLIP encoder...")
     siglip = build_siglip_encoder()
 
-    print("Loading Qwen VLM via vLLM...")
+    print("Preparing Qwen VLM (vLLM engine loads lazily on first use)...")
     llm = build_llm(
         model=args.model,
         tensor_parallel_size=args.tp,
@@ -80,6 +84,7 @@ def main():
         max_model_len=args.max_model_len,
         min_pixels=args.min_pixels,
         max_pixels=args.max_pixels,
+        lazy=True,
     )
 
     whisper_model = None
@@ -108,6 +113,7 @@ def main():
         "soft_boundary_thresh":    args.soft_boundary,
         "question_time_refs":      question_time_refs,
         "video_type":              args.video_type,
+        "subtitle_path":           args.subtitles,
     }
 
     from qvkg.builder import VKGBuilder
