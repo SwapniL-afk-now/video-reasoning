@@ -638,8 +638,10 @@ def walker_controller_sampling(action_schema: dict) -> SamplingParams:
 
 WALKER_CONTROLLER_SYSTEM = (
     "You are navigating a video knowledge graph to answer a question. "
-    "You see the current sub-graph (nodes with ids + explicit edges) and a list "
-    "of missing evidence (gaps). Choose EXACTLY ONE action to fill the largest "
+    "You see frames from the video, the current sub-graph (nodes with ids + "
+    "explicit edges), and a list of missing evidence (gaps). Use the frames "
+    "to visually verify where evidence is lacking before choosing an action. "
+    "Choose EXACTLY ONE action to fill the largest "
     "gap, or ANSWER with citations once every gap is filled.\n\n"
     "Actions:\n"
     "- EXPAND(relation): follow an edge family from the frontier. "
@@ -650,8 +652,9 @@ WALKER_CONTROLLER_SYSTEM = (
     "- RECALL(query): semantic search when the frontier is exhausted.\n"
     "- ANSWER(letter, cited_node_ids): answer with the node ids that support it.\n"
     "- STOP_REQUEST: you believe you are done (still gated by the verifier).\n\n"
-    "Prefer EXPAND/DISCRIMINATE that target a named gap. Only ANSWER when the "
-    "gaps list is empty. Output one JSON action."
+    "Look at the frames before deciding. If you can see visual evidence for a "
+    "specific option directly, favour ANSWER over further exploration. "
+    "Prefer EXPAND/DISCRIMINATE that target a named gap. Output one JSON action."
 )
 
 WALKER_ANSWER_SYSTEM = (

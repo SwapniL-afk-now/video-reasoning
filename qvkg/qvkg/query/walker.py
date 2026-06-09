@@ -16,7 +16,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from ..schema import AnswerResult, VKGraph
+from ..schema import AnswerResult, VKGNode, VKGraph
 from ..vllm_client import (
     WALKER_ANSWER_SAMPLING,
     WALKER_ANSWER_SYSTEM,
@@ -26,7 +26,12 @@ from ..vllm_client import (
 )
 from . import graph_ops
 from . import warrant as warrant_mod
-from .actions import ACTION_SCHEMA, WalkState, execute_action
+from .actions import (
+    MAX_IMAGE_FRAMES_PER_PROMPT,
+    ACTION_SCHEMA,
+    WalkState,
+    execute_action,
+)
 from .frame_extractor import extract_frames_for_window, frames_to_b64_urls
 from .intent import parse_time_reference
 from .serializer import ContextSerializer
@@ -136,6 +141,33 @@ def seed_state(
 
 
 # ---------------------------------------------------------------------------
+# Frame batching helpers
+# ---------------------------------------------------------------------------
+
+def frame_to_text_summary(graph: VKGraph, timestamp: float,
+                          window_sec: float = 3.0) -> str:
+    """Build a text description of VKG content near a frame's timestamp.
+
+    Used by :meth:`WalkState.archive_old_frames` to convert image frames
+    that exceed the per-prompt image limit into persistent text summaries.
+    """
+    nodes = graph.get_nodes_in_window(timestamp - window_sec,
+                                      timestamp + window_sec)
+    texts: List[str] = []
+    for n in nodes:
+        if n.label and len(n.label) > 3:
+            texts.append(n.label)
+        if n.node_type == "OCRNode" and getattr(n, 'text', None):
+            texts.append(f"OCR: {n.text[:120]}")
+        if n.node_type == "ASRNode" and getattr(n, 'text', None):
+            texts.append(f"ASR: {n.text[:120]}")
+        if n.canonical_description:
+            texts.append(n.canonical_description[:200])
+    unique = list(dict.fromkeys(texts))
+    return " | ".join(unique)[:600] if unique else "(no caption)"
+
+
+# ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
@@ -143,14 +175,21 @@ def _subgraph_of(graph: VKGraph, node_ids: Set[str]):
     return graph_ops.build_subgraph(graph, node_ids)
 
 
-def _controller_messages(state: WalkState, graph: VKGraph) -> list:
-    """Text-only controller prompt: serialized sub-graph + gaps + last answer."""
+def _controller_messages(state: WalkState, graph: VKGraph,
+                         max_image_frames: int = MAX_IMAGE_FRAMES_PER_PROMPT) -> list:
+    """Multimodal controller prompt — frames + serialized subgraph + gaps.
+
+    Unlike the answerer, the controller's job is *navigation*: it sees the
+    same frame archive and image batch so it can visually verify whether a
+    ZOOM target is promising, or whether an EXPAND actually reached a scene
+    relevant to the question — eliminating blind text-only turns.
+    """
     sub = _subgraph_of(graph, state.node_ids)
     ctx = _SERIALIZER.serialize(
         sub, state.question, intents=[], question_types=state.qtype,
         t_start=state.time_reference[0] if state.time_reference else None,
         t_end=state.time_reference[1] if state.time_reference else None,
-        visual_provided=False,
+        visual_provided=bool(state.frames),
         include_edges=True,
     )
 
@@ -164,22 +203,47 @@ def _controller_messages(state: WalkState, graph: VKGraph) -> list:
     frontier_preview = ", ".join(sorted(state.frontier)[:12]) or "(empty)"
     ans = state.current_answer or "(none yet)"
 
-    user = (
+    content: List[dict] = []
+
+    # 1) Frame archive — text summaries of previously analyzed frame batches.
+    if state.frame_archive:
+        archive_block = "\n".join(
+            f"- {e}" for e in state.frame_archive[-30:])
+        content.append({"type": "text", "text":
+            f"## Previously analyzed frames (text summaries)\n{archive_block}\n"})
+
+    # 2) Current image batch — at most max_image_frames.
+    batch = state.frames
+    if len(batch) > max_image_frames:
+        batch = batch[-max_image_frames:]
+    for url, ts in batch:
+        content.append({"type": "image_url", "image_url": {"url": url}})
+        content.append({"type": "text", "text": f"[t={ts:.0f}s]"})
+
+    # 3) Navigation context (same as before, as text).
+    content.append({"type": "text", "text":
         f"{ctx}\n\n"
         f"## Frontier node ids\n{frontier_preview}\n\n"
         f"## Missing evidence (gaps)\n{gap_text}\n\n"
         f"## Coverage so far\n{coverage:.2f}\n\n"
         f"## Your last tentative answer\n{ans}\n\n"
-        f"Choose ONE action (JSON)."
-    )
+        f"Choose ONE action (JSON)."})
+
     return [
         {"role": "system", "content": WALKER_CONTROLLER_SYSTEM},
-        {"role": "user", "content": user},
+        {"role": "user", "content": content},
     ]
 
 
-def _answerer_messages(state: WalkState, graph: VKGraph, node_ids: Set[str]) -> list:
-    """Multimodal answerer prompt over a specific node set (full or ablated)."""
+def _answerer_messages(state: WalkState, graph: VKGraph, node_ids: Set[str],
+                       max_image_frames: int = MAX_IMAGE_FRAMES_PER_PROMPT) -> list:
+    """Multimodal answerer prompt — respects Qwen's 10-image-per-prompt limit.
+
+    Frames beyond ``max_image_frames`` are converted to text summaries (from
+    VKG metadata) and fed as context alongside the current image batch. This
+    lets the model process arbitrarily many frames across hops without
+    exceeding the architecture's image budget.
+    """
     sub = _subgraph_of(graph, node_ids)
     ctx = _SERIALIZER.serialize(
         sub, state.question, intents=[], question_types=state.qtype,
@@ -189,9 +253,23 @@ def _answerer_messages(state: WalkState, graph: VKGraph, node_ids: Set[str]) -> 
         include_edges=True,
     )
     content: List[dict] = []
-    for url, ts in state.frames:
+
+    # 1) Frame archive — text summaries of previously analyzed frame batches.
+    if state.frame_archive:
+        archive_block = "\n".join(
+            f"- {e}" for e in state.frame_archive[-30:])
+        content.append({"type": "text", "text":
+            f"## Previously analyzed frames (text summaries)\n{archive_block}\n"})
+
+    # 2) Current image batch — at most max_image_frames.
+    batch = state.frames
+    if len(batch) > max_image_frames:
+        batch = batch[-max_image_frames:]
+    for url, ts in batch:
         content.append({"type": "image_url", "image_url": {"url": url}})
         content.append({"type": "text", "text": f"[t={ts:.0f}s]"})
+
+    # 3) Serialized sub-graph context.
     content.append({"type": "text", "text": ctx})
     return [
         {"role": "system", "content": WALKER_ANSWER_SYSTEM},
@@ -389,6 +467,18 @@ def batch_walk_answer_questions(
                 ablated_answers[s.qid] = extract_mcq_answer(o.outputs[0].text) if mcq \
                     else o.outputs[0].text.strip()
 
+        # ---- 3b) Archive old frames, store answerer analysis as text. ----
+        # Frames beyond the per-prompt image limit are converted to VKG-text
+        # summaries so no visual evidence is lost. The answerer's own output
+        # is stored alongside as a persistent "analysis" that survives frame
+        # eviction.
+        for s in pending:
+            if s.current_answer:
+                s.frame_archive.append(
+                    f"[hop {s.hop}] Answerer analysis: {s.current_answer}"
+                )
+            s.archive_old_frames(graph)
+
         # ---- 4) Recompute warrant; retire satisfied states. ----
         for s in pending:
             sub = _subgraph_of(graph, s.node_ids)
@@ -434,6 +524,7 @@ def _hop_record(state: WalkState, action, verify_ok, verify_why) -> dict:
         "frontier_size": len(state.frontier),
         "subgraph_size": len(state.node_ids),
         "n_frames": len(state.frames),
+        "n_frame_archive": len(state.frame_archive),
         "coverage": w.coverage if w else None,
         "gaps": w.gaps if w else None,
         "elasticity": w.elasticity if w else None,

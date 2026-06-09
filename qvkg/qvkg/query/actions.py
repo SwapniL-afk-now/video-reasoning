@@ -15,6 +15,8 @@ from ..schema import VKGNode, VKGraph
 from . import graph_ops
 from .frame_extractor import extract_frames_for_window, frames_to_b64_urls
 
+MAX_IMAGE_FRAMES_PER_PROMPT: int = 10  # Qwen's 10-image-per-turn limit
+
 # ---------------------------------------------------------------------------
 # Action JSON schema (constrained decode)
 # ---------------------------------------------------------------------------
@@ -81,6 +83,10 @@ class WalkState:
     frames: List[Tuple[str, float]] = field(default_factory=list)
     _frame_ts_buckets: Set[int] = field(default_factory=set)
 
+    # text summaries of frames evicted from the image slot — preserves
+    # analysis of older frame batches once they exceed MAX_IMAGE_FRAMES_PER_PROMPT.
+    frame_archive: List[str] = field(default_factory=list)
+
     current_answer: Optional[str] = None
     cited_node_ids: List[str] = field(default_factory=list)
     discriminated: Set[str] = field(default_factory=set)  # MCQ options already probed
@@ -91,20 +97,34 @@ class WalkState:
     final_answer: Optional[str] = None
 
     MAX_NODES: int = 80
-    MAX_FRAMES: int = 10
 
     # -- helpers --------------------------------------------------------
 
     def add_frames(self, urls_ts: List[Tuple[str, float]]) -> None:
-        """Add frames, deduplicated by ~10s timestamp bucket, capped at MAX_FRAMES."""
+        """Add frames, deduplicated by ~10s timestamp bucket. No hard cap."""
         for url, ts in urls_ts:
-            if len(self.frames) >= self.MAX_FRAMES:
-                break
             bucket = int(ts // 10)
             if bucket in self._frame_ts_buckets:
                 continue
             self._frame_ts_buckets.add(bucket)
             self.frames.append((url, ts))
+
+    def archive_old_frames(self, graph: VKGraph,
+                           keep: int = MAX_IMAGE_FRAMES_PER_PROMPT) -> None:
+        """Archive frames beyond the latest ``keep``, converting to text summaries.
+
+        Archived frames are removed from ``self.frames``; their text description
+        (sourced from VKG metadata at that timestamp) is appended to
+        ``self.frame_archive`` for inclusion in future answerer prompts.
+        """
+        if len(self.frames) <= keep:
+            return
+        old = self.frames[:-keep]
+        self.frames = self.frames[-keep:]
+        from .walker import frame_to_text_summary
+        for _, ts in old:
+            summary = frame_to_text_summary(graph, ts)
+            self.frame_archive.append(f"[t={ts:.0f}s] {summary}")
 
     def absorb(self, new_ids: Set[str]) -> Set[str]:
         """Merge ``new_ids`` into node_ids; return the genuinely new ring."""
