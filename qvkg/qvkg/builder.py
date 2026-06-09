@@ -928,49 +928,66 @@ class VKGBuilder:
         TV/show content names people via OCR text (e.g. "SERINAH") displayed
         while the person is on screen, but the extractor mints the OCRNode and
         CharacterNode independently — the graph knows the name appeared and
-        that a person appeared, never that they are the same identity. Add a
-        DESCRIBES edge OCR -> character for co-occurring pairs, and fold the
-        name into the character's label so every downstream serialization and
-        keyword match sees it.
+        that a person appeared, never that they are the same identity.
+
+        A banner usually recurs every time its person is on screen, while
+        bystanders change — so the character whose appearance timestamps
+        co-occur with the MOST occurrences of a given banner is its referent.
+        That character gets the name folded into its label (visible to every
+        serialization and keyword match); all co-occurring characters get a
+        DESCRIBES edge as weaker evidence.
         """
         chars = graph.get_nodes_by_type("CharacterNode")
         ocrs = graph.get_nodes_by_type("OCRNode")
         if not chars or not ocrs:
             return
-        n_edges = n_named = 0
+
+        def _app_ts(c) -> list:
+            apps = (c.metadata or {}).get("appearances", [])
+            ts = [a.get("timestamp") for a in apps if a.get("timestamp") is not None]
+            return ts or ([c.t_start] if c.t_start is not None else [])
+
+        # name -> list of banner OCR nodes
+        by_name: Dict[str, list] = {}
         for o in ocrs:
             text = (o.label or "").strip()
-            # Name-like banner: 1-3 capitalized/UPPERCASE alphabetic words.
-            if not text or not self._NAME_BANNER_RE.match(text.title()):
+            if not text or any(ch_.isdigit() for ch_ in text):
                 continue
-            if not any(c.isalpha() for c in text) or any(c.isdigit() for c in text):
+            if not self._NAME_BANNER_RE.match(text.title()):
                 continue
-            name = text.title()
-            nearby = [c for c in chars
-                      if c.t_start is not None and o.t_start is not None
-                      and abs(c.t_start - o.t_start) <= 4.0]
-            for c in nearby:
-                graph.add_edge(VKGEdge(
-                    source_id=o.id, target_id=c.id,
-                    relation_type="DESCRIBES",
-                    weight=1.0, confidence=0.7 if len(nearby) > 1 else 0.9,
-                    metadata={"source": "ocr_name_banner", "name": name},
-                ))
-                n_edges += 1
-            # Only rename when the banner unambiguously points at one person.
-            if len(nearby) == 1:
-                c = nearby[0]
-                label = c.label or ""
-                if name.lower() not in label.lower():
-                    c.label = f"{name} ({label})" if label else name
+            by_name.setdefault(text.title(), []).append(o)
+
+        n_edges = n_named = 0
+        for name, banners in by_name.items():
+            times = sorted({round(o.t_start, 1) for o in banners
+                            if o.t_start is not None})
+            if not times:
+                continue
+            # Count, per character, how many banner occurrences it co-occurs with.
+            scores: Dict[str, int] = {}
+            for c in chars:
+                ts = _app_ts(c)
+                scores[c.id] = sum(1 for bt in times
+                                   if any(abs(t - bt) <= 5.0 for t in ts))
+            hits = {cid: sc for cid, sc in scores.items() if sc > 0}
+            if not hits:
+                continue
+            for o in banners:
+                for cid in hits:
+                    graph.add_edge(VKGEdge(
+                        source_id=o.id, target_id=cid,
+                        relation_type="DESCRIBES", weight=1.0,
+                        confidence=0.6,
+                        metadata={"source": "ocr_name_banner", "name": name},
+                    ))
+                    n_edges += 1
+            # Name the character only when one candidate clearly dominates.
+            ranked = sorted(hits.items(), key=lambda kv: -kv[1])
+            if len(ranked) == 1 or ranked[0][1] >= 2 * max(1, ranked[1][1]):
+                c = graph.nodes.get(ranked[0][0])
+                if c is not None and name.lower() not in (c.label or "").lower():
+                    c.label = f"{name} ({c.label})" if c.label else name
                     n_named += 1
-                    # Propagate the name to same-entity appearances.
-                    if c.entity_id:
-                        for nid in graph.entity_idx.get(c.entity_id, []):
-                            n = graph.nodes.get(nid)
-                            if n is not None and n.node_type == "CharacterNode" \
-                               and name.lower() not in (n.label or "").lower():
-                                n.label = f"{name} ({n.label})" if n.label else name
         print(f"  OCR name banners: {n_edges} DESCRIBES edges, "
               f"{n_named} characters named")
 
