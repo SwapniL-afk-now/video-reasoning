@@ -47,6 +47,37 @@ def _relevant_types(question_types: List[str]) -> Optional[Set[str]]:
 
 class ContextSerializer:
 
+    # Edge families surfaced explicitly in the ## Graph Edges section.
+    _EDGE_FAMILIES = (
+        "CAUSES", "ENABLES", "PREVENTS", "MOTIVATES",
+        "SAME_ENTITY", "SPOKEN_BY", "EMOTION_SHIFT",
+    )
+
+    def _edge_lines(self, subgraph: SubGraph) -> List[str]:
+        """Render induced causal / same-entity / speaker / emotion edges with ids."""
+        lines: List[str] = []
+        families = set(self._EDGE_FAMILIES)
+        seen: Set = set()
+        for e in subgraph.edges:
+            if e.relation_type not in families:
+                continue
+            src = subgraph.nodes.get(e.source_id)
+            tgt = subgraph.nodes.get(e.target_id)
+            if not src or not tgt:
+                continue
+            key = (e.source_id, e.target_id, e.relation_type)
+            if key in seen:
+                continue
+            seen.add(key)
+            lines.append(
+                f"  ({e.source_id}) [{src.t_start:.0f}s] {src.label[:40]} "
+                f"──{e.relation_type}──▶ "
+                f"({e.target_id}) [{tgt.t_start:.0f}s] {tgt.label[:40]}"
+            )
+            if len(lines) >= 40:
+                break
+        return lines
+
     def serialize(
         self,
         subgraph: SubGraph,
@@ -56,6 +87,7 @@ class ContextSerializer:
         t_start: Optional[float] = None,
         t_end:   Optional[float] = None,
         visual_provided: bool = False,
+        include_edges: bool = False,
     ) -> str:
         """Serialize a subgraph to a VLM-readable context string.
 
@@ -63,6 +95,10 @@ class ContextSerializer:
         alongside this text.  In that mode we skip ActionNode and ObjectNode
         descriptions — the model can read those directly from the images, and
         including noisy per-window descriptions only adds misleading signal.
+
+        include_edges=True appends an explicit ``## Graph Edges`` section listing
+        the induced causal / SAME_ENTITY / SPOKEN_BY links so the model reasons
+        over the graph structure, not just a flat timeline. Used by the walker.
         """
         sections: List[str] = []
 
@@ -278,6 +314,14 @@ class ContextSerializer:
                     sections.append(
                         f"  [{n.t_start:.0f}s–{n.t_end:.0f}s] [{n.node_type}] {n.label}"
                     )
+
+        # Explicit graph-edge section (walker mode) — surface the induced
+        # causal / same-entity / speaker links the flat timeline hides.
+        if include_edges:
+            edge_lines = self._edge_lines(subgraph)
+            if edge_lines:
+                sections.append("\n## Graph Edges")
+                sections.extend(edge_lines)
 
         context = "\n".join(sections)
         return (

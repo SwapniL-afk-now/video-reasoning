@@ -609,6 +609,62 @@ MCQ_REASONING_SAMPLING = SamplingParams(
     max_tokens=8192,
 )
 
+# ---------------------------------------------------------------------------
+# Walker (inference-time agentic graph traversal) sampling + prompts
+# ---------------------------------------------------------------------------
+
+# Answerer / elasticity read-out. Kept at the original MCQ thinking budget
+# (temperature + 8192-token cap) — the model reasons freely inside <think>…</think>
+# before emitting the answer letter.
+WALKER_ANSWER_SAMPLING = SamplingParams(
+    temperature=1.0,
+    top_p=0.95,
+    top_k=20,
+    min_p=0.0,
+    presence_penalty=1.5,
+    max_tokens=8192,
+)
+
+
+def walker_controller_sampling(action_schema: dict) -> SamplingParams:
+    """Greedy, schema-constrained single-action decode (≤256 tokens)."""
+    return SamplingParams(
+        temperature=0.0,
+        top_p=1.0,
+        max_tokens=256,
+        structured_outputs=StructuredOutputsParams(json=action_schema),
+    )
+
+
+WALKER_CONTROLLER_SYSTEM = (
+    "You are navigating a video knowledge graph to answer a question. "
+    "You see the current sub-graph (nodes with ids + explicit edges) and a list "
+    "of missing evidence (gaps). Choose EXACTLY ONE action to fill the largest "
+    "gap, or ANSWER with citations once every gap is filled.\n\n"
+    "Actions:\n"
+    "- EXPAND(relation): follow an edge family from the frontier. "
+    "relation ∈ {CAUSAL, ENTITY, SPEAKER, TEMPORAL, EMOTION, SIMILAR, CONTAINS}.\n"
+    "- ZOOM(node_id): materialise frames + fine detail at a node.\n"
+    "- DISCRIMINATE(option): retrieve evidence separating an MCQ option (A/B/C/D) "
+    "from rivals.\n"
+    "- RECALL(query): semantic search when the frontier is exhausted.\n"
+    "- ANSWER(letter, cited_node_ids): answer with the node ids that support it.\n"
+    "- STOP_REQUEST: you believe you are done (still gated by the verifier).\n\n"
+    "Prefer EXPAND/DISCRIMINATE that target a named gap. Only ANSWER when the "
+    "gaps list is empty. Output one JSON action."
+)
+
+WALKER_ANSWER_SYSTEM = (
+    "You are a video analyst answering a multiple choice question. "
+    "You are given frames and a knowledge sub-graph with explicit edges "
+    "(causal chains, same-entity threads, speaker links).\n\n"
+    "Reason over the explicit edges, the timeline, and the frames. "
+    "Prefer narration and on-screen text (OCR) over visual guesses. "
+    "Evaluate each option (A, B, C, D) against the cited evidence.\n\n"
+    "After brief reasoning, output ONE line containing ONLY the answer letter: "
+    "A, B, C, or D."
+)
+
 MCQ_SYSTEM_PROMPT = (
     "You are a video analyst answering a multiple choice question. "
     "You are given frames from the video and structured knowledge extracted from it.\n\n"

@@ -73,12 +73,15 @@ class VKGBuilder:
         import torch.multiprocessing as tmp
         from .sampler import _whisper_transcribe_worker
 
-        whisper_model_size = getattr(self.whisper, "_model_size", "large-v3")
+        whisper_model_size = getattr(self.whisper, "_model_size", "large-v3-turbo")
+        whisper_compute_type = (getattr(self.whisper, "_compute_type", None)
+                                or self.config.get("whisper_compute_type", "int8_float16"))
         try:
             ctx = tmp.get_context("spawn")
             with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
                 future = executor.submit(
-                    _whisper_transcribe_worker, video_path, whisper_model_size
+                    _whisper_transcribe_worker, video_path, whisper_model_size,
+                    whisper_compute_type,
                 )
                 return future.result()
         except Exception as e:
@@ -123,6 +126,9 @@ class VKGBuilder:
                     soft_thresh=self.config.get("soft_boundary_thresh", 0.5),
                     n_workers=self.config.get("n_chunk_workers", 8),
                     coarse_fps=self.config.get("coarse_fps", 1.0),
+                    flow_max_dim=self.config.get("flow_max_dim", 256),
+                    use_optical_flow=self.config.get("use_optical_flow", True),
+                    coarse_frame_cap=self.config.get("coarse_frame_cap", 0),
                 )
 
                 question_time_refs = self.config.get("question_time_refs", [])

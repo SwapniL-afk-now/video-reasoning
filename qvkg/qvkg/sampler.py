@@ -56,11 +56,29 @@ def _siglip_chunk_worker(jpeg_bytes_list: list, model_name: str, device: str) ->
 # Module-level Whisper worker
 # ---------------------------------------------------------------------------
 
-def _whisper_transcribe_worker(video_path: str, model_size: str) -> list:
-    """Worker process: load Whisper, transcribe, return segments, exit."""
+def _whisper_transcribe_worker(
+    video_path: str,
+    model_size: str,
+    compute_type: str = "int8_float16",
+) -> list:
+    """Worker process: load Whisper, transcribe, return segments, exit.
+
+    Tuned for throughput (§5): VAD skips silence, greedy (beam_size=1) decoding,
+    int8_float16 compute, and condition_on_previous_text=False to avoid
+    drift-induced re-decodes. The transcript feeds graph nodes, not a leaderboard."""
     from faster_whisper import WhisperModel
-    model = WhisperModel(model_size, device="cuda", compute_type="float16")
-    segments, _ = model.transcribe(video_path, word_timestamps=True)
+    try:
+        model = WhisperModel(model_size, device="cuda", compute_type=compute_type)
+    except Exception:
+        # Some GPUs/builds reject int8_float16 — fall back to float16.
+        model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    segments, _ = model.transcribe(
+        video_path,
+        word_timestamps=True,
+        vad_filter=True,
+        beam_size=1,
+        condition_on_previous_text=False,
+    )
     result = list(segments)
     del model
     return result
@@ -70,6 +88,11 @@ class HierarchicalSampler:
     def __init__(self, siglip_encoder=None, yolo_model=None):
         self.siglip = siglip_encoder
         self.yolo = yolo_model  # optional YOLOv8n for object count delta scoring
+        # Scoring-stage config + per-frame caches (set in sample()).
+        self.flow_max_dim: int = 256
+        self.use_optical_flow: bool = True
+        self._gray_small: Optional[list] = None   # downscaled grayscale per frame idx
+        self._hist: Optional[list] = None         # normalized 8x8x8 histogram per frame idx
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -77,18 +100,44 @@ class HierarchicalSampler:
 
     def sample(self, video_path: str, budget: int = 500,
                hard_thresh: float = 0.75, soft_thresh: float = 0.5,
-                n_workers: int = 8, coarse_fps: float = 1.0) -> SampleResult:
+                n_workers: int = 8, coarse_fps: float = 1.0,
+                flow_max_dim: int = 256, use_optical_flow: bool = True,
+                coarse_frame_cap: int = 0) -> SampleResult:
+        import time as _time
+
+        # Config for the CPU scoring stage (read by _score_frame / caches).
+        self.flow_max_dim = int(flow_max_dim) if flow_max_dim else 256
+        self.use_optical_flow = bool(use_optical_flow)
+
+        t0 = _time.time()
         coarse, fps, audio_rms = self._extract_coarse_frames(
             video_path, target_fps=coarse_fps, n_workers=n_workers,
+            coarse_frame_cap=coarse_frame_cap,
         )
+        print(f"  [timing] step=decode+audio t={_time.time()-t0:.1f}s")
         if not coarse:
             return SampleResult([], [], [])
 
         print(f"  Extracted {len(coarse)} coarse frames at ~{coarse_fps}fps")
+
+        # Cache per-frame grayscale (downscaled) + colour histogram ONCE so the
+        # scoring + boundary passes never recompute cvtColor / calcHist (§2).
+        t1 = _time.time()
+        self._gray_small, self._hist = self._precompute_caches(coarse)
+        print(f"  [timing] step=cache(gray+hist) t={_time.time()-t1:.1f}s")
+
+        t2 = _time.time()
         siglip_embs = self._siglip_batch(coarse)
+        print(f"  [timing] step=siglip t={_time.time()-t2:.1f}s")
+
+        t3 = _time.time()
         scores = self._score_all(coarse, audio_rms, siglip_embs)
+        print(f"  [timing] step=score t={_time.time()-t3:.1f}s")
+
+        t4 = _time.time()
         boundaries = self._detect_boundaries(coarse, scores, hard_thresh, soft_thresh,
                                               embeddings=siglip_embs)
+        print(f"  [timing] step=boundaries t={_time.time()-t4:.1f}s")
         print(f"  Detected {len(boundaries)} scenes")
 
         keyframes: List[FrameInfo] = []
@@ -105,6 +154,10 @@ class HierarchicalSampler:
 
         keyframes = self._rebalance(keyframes, scores, coarse, budget)
         print(f"  Selected {len(keyframes)} keyframes (budget={budget})")
+        print(f"  [timing] step=sample_total t={_time.time()-t0:.1f}s")
+        # Release per-frame caches.
+        self._gray_small = None
+        self._hist = None
         return SampleResult(
             keyframes=keyframes, scenes=boundaries, episodes=[],
             siglip_embeddings=siglip_embs,
@@ -220,6 +273,7 @@ class HierarchicalSampler:
 
     def _extract_coarse_frames(
         self, video_path: str, target_fps: float = 3.0, n_workers: int = 8,
+        coarse_frame_cap: int = 0,
     ) -> Tuple[List[FrameInfo], float, np.ndarray]:
         # Probe duration and fps first (cheap, no frame decode)
         container = av.open(video_path)
@@ -227,6 +281,17 @@ class HierarchicalSampler:
         fps = float(stream.average_rate or 25)
         duration = float(stream.duration * stream.time_base) if stream.duration else 0
         container.close()
+
+        # Adaptive coarse sampling for very long videos (§6): cap the total
+        # coarse frame count so every downstream CPU op stays bounded. The
+        # effective fps tapers; question-aware densification (run later) keeps
+        # referenced windows dense regardless.
+        if coarse_frame_cap and duration > 0:
+            max_fps = coarse_frame_cap / duration
+            if max_fps < target_fps:
+                print(f"  [sampler] coarse cap {coarse_frame_cap} frames over "
+                      f"{duration:.0f}s → fps {target_fps:.2f}→{max_fps:.3f}")
+                target_fps = max_fps
 
         audio_rms = self._extract_audio_rms(video_path)
 
@@ -282,13 +347,18 @@ class HierarchicalSampler:
             if not samples:
                 return np.zeros(10000)
             audio = np.concatenate(samples)
-            sr = stream.sample_rate or 44100
+            sr = int(stream.sample_rate or 44100)
             sec = max(1, int(len(audio) / sr))
             rms = np.zeros(sec + 1)
-            for i in range(sec):
-                chunk = audio[i * sr:(i + 1) * sr]
-                if len(chunk) > 0:
-                    rms[i] = float(np.sqrt(np.mean(chunk ** 2)))
+            # Vectorized per-second RMS: reshape full seconds at once (§7).
+            n_full = (len(audio) // sr)
+            if n_full > 0:
+                block = audio[:n_full * sr].reshape(n_full, sr)
+                rms[:n_full] = np.sqrt((block.astype(np.float32) ** 2).mean(axis=1))
+            # Trailing partial second.
+            tail = audio[n_full * sr:]
+            if n_full < sec and len(tail) > 0:
+                rms[n_full] = float(np.sqrt(np.mean(tail.astype(np.float32) ** 2)))
             if rms.max() > 0:
                 rms = rms / rms.max()
             return rms
@@ -299,24 +369,50 @@ class HierarchicalSampler:
     # Scoring
     # ------------------------------------------------------------------
 
+    def _precompute_caches(self, frames: List[FrameInfo]):
+        """Compute downscaled grayscale + colour histogram once per frame.
+
+        Reused by both scoring and boundary detection so cvtColor / calcHist
+        run exactly once per frame instead of 2–3× (§2). Grayscale is downscaled
+        to ``flow_max_dim`` on the long side so optical flow / text scoring are
+        cheap (§1)."""
+        max_dim = max(32, int(self.flow_max_dim))
+        grays: list = []
+        hists: list = []
+        for f in frames:
+            rgb = np.array(f.image)
+            # Full-res colour histogram (8x8x8, normalized).
+            h = cv2.calcHist([rgb], [0, 1, 2], None, [8, 8, 8],
+                             [0, 256, 0, 256, 0, 256])
+            hists.append(cv2.normalize(h, h).flatten())
+            # Downscaled grayscale (long side ≤ max_dim) for flow + text.
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            gh, gw = gray.shape
+            scale = max_dim / float(max(gh, gw))
+            if scale < 1.0:
+                gray = cv2.resize(gray, (max(1, int(gw * scale)),
+                                         max(1, int(gh * scale))))
+            grays.append(gray)
+        return grays, hists
+
     def _score_frame(self, i: int, frames: List[FrameInfo],
                      embeddings: Optional[np.ndarray],
                      audio_rms: np.ndarray) -> float:
-        prev_img = np.array(frames[i - 1].image) if i > 0 else np.array(frames[i].image)
-        curr_img = np.array(frames[i].image)
-
-        hist_d = self._histogram_diff(curr_img, prev_img)
+        hist_d = self._histogram_diff_cached(i, i - 1) if i > 0 else 0.0
         sem_d = (1.0 - float(np.dot(embeddings[i], embeddings[i - 1]))) if i > 0 and embeddings is not None else 0.0
-        motion = self._optical_flow_mag(prev_img, curr_img)
         ts = int(frames[i].timestamp)
         audio_e = float(audio_rms[min(ts, len(audio_rms) - 1)])
-        text_s = self._text_region_score(curr_img)
+        text_s = self._text_region_score_cached(i)
 
-        # Text presence is weighted so frames bearing on-screen captions / name
-        # lower-thirds are retained as keyframes and reach the OCR/VLM stage —
-        # otherwise short captions (e.g. a guest's name) never enter the graph.
-        return (0.25 * hist_d + 0.25 * sem_d + 0.15 * motion
-                + 0.15 * audio_e + 0.20 * text_s)
+        if self.use_optical_flow and i > 0:
+            motion = self._optical_flow_mag_cached(i)
+            # Text presence is weighted so frames bearing on-screen captions /
+            # name lower-thirds are retained as keyframes.
+            return (0.25 * hist_d + 0.25 * sem_d + 0.15 * motion
+                    + 0.15 * audio_e + 0.20 * text_s)
+        # Motion term dropped → renormalize remaining weights (§1).
+        return (0.30 * hist_d + 0.30 * sem_d
+                + 0.18 * audio_e + 0.22 * text_s)
 
     def _score_all(
         self, frames: List[FrameInfo], audio_rms: np.ndarray,
@@ -346,76 +442,80 @@ class HierarchicalSampler:
             chunk_scores[local_i] = self._score_frame(global_i, frames, embeddings, audio_rms)
         return idx_range, chunk_scores
 
-    def _siglip_batch(self, frames: List[FrameInfo], n_workers: int = 8) -> Optional[np.ndarray]:
-        """Encode frames through N independent SigLIP worker processes.
+    def _siglip_batch(self, frames: List[FrameInfo], gpu_batch: int = 384) -> Optional[np.ndarray]:
+        """Encode all frames in one main-process SigLIP pass, in large GPU batches.
 
-        Each worker loads its own SigLIP instance on the GPU, encodes its
-        chunk of frames, then exits — releasing its GPU allocation.
-        The main-process SigLIP is moved to CPU during this phase so workers
-        have maximum VRAM headroom.
-
-        Frame data is shared via JPEG bytes (~100 KB/frame) to avoid the
-        ~36 GB cost of serialising raw pixel arrays.
+        SigLIP is GPU-bound and batches near-linearly; a single already-loaded
+        model encoding hundreds of images per batch beats the previous N-process
+        fan-out (which paid the model-load cost up to 8× and contended for one
+        device). Runs under ``inference_mode`` + fp16 autocast.
         """
         if self.siglip is None:
             return None
 
         import torch
-        import torch.multiprocessing as tmp
-        from concurrent.futures import ProcessPoolExecutor
 
         try:
             images = [f.image for f in frames]
             n = len(images)
+            dim = self.siglip.model.config.vision_config.hidden_size
             if n == 0:
-                return np.zeros((0, self.siglip.model.config.vision_config.hidden_size))
+                return np.zeros((0, dim))
 
-            # -- Compress frames to JPEG bytes in parallel (CPU, fast) --
-            def _to_jpeg(img):
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=85)
-                return buf.getvalue()
-
-            with ThreadPoolExecutor(max_workers=min(16, n)) as pool:
-                jpeg_bytes = list(pool.map(_to_jpeg, images))
-
-            # -- Split into equal chunks for workers --
-            actual_workers = min(n_workers, n)
-            chunk_size = max(1, n // actual_workers)
-            chunks = [jpeg_bytes[i:i + chunk_size]
-                      for i in range(0, n, chunk_size)]
-
-            model_name = self.siglip.model_name
-            device     = self.siglip.device
-
-            # Move main SigLIP to CPU so workers have full VRAM
-            self.siglip.model.cpu()
-            torch.cuda.empty_cache()
-            print(f"  [siglip] spawning {len(chunks)} worker processes "
-                  f"({n} frames, ~{chunk_size} each)")
-
-            try:
-                with ProcessPoolExecutor(
-                    max_workers=len(chunks),
-                    mp_context=tmp.get_context("spawn"),
-                ) as executor:
-                    futures = [
-                        executor.submit(_siglip_chunk_worker, chunk, model_name, device)
-                        for chunk in chunks
-                    ]
-                    results = [f.result() for f in futures]
-
-                return np.concatenate(results, axis=0)
-
-            finally:
-                # Always restore main SigLIP to GPU
-                self.siglip.model.to(self.siglip.device)
-                torch.cuda.empty_cache()
+            device = self.siglip.device
+            use_autocast = device == "cuda"
+            out: List[np.ndarray] = []
+            print(f"  [siglip] single-pass encode: {n} frames "
+                  f"in batches of {gpu_batch}")
+            with torch.inference_mode():
+                for i in range(0, n, gpu_batch):
+                    batch = images[i:i + gpu_batch]
+                    inputs = self.siglip.processor(
+                        images=batch, return_tensors="pt"
+                    ).to(device)
+                    if use_autocast:
+                        with torch.autocast("cuda", dtype=torch.float16):
+                            output = self.siglip.model.get_image_features(**inputs)
+                    else:
+                        output = self.siglip.model.get_image_features(**inputs)
+                    feats = (output.pooler_output
+                             if hasattr(output, "pooler_output") else output[1])
+                    feats = feats / feats.norm(dim=-1, keepdim=True)
+                    out.append(feats.cpu().float().numpy())
+            return np.concatenate(out, axis=0) if out else np.zeros((0, dim))
 
         except Exception:
             import traceback
             traceback.print_exc()
             return None
+
+    # -- Cached scoring helpers (use the per-frame caches from _precompute_caches) --
+
+    def _histogram_diff_cached(self, i: int, j: int) -> float:
+        """Bhattacharyya distance between two cached histograms."""
+        if self._hist is None:
+            return 0.0
+        return float(cv2.compareHist(self._hist[i], self._hist[j],
+                                     cv2.HISTCMP_BHATTACHARYYA))
+
+    def _optical_flow_mag_cached(self, i: int) -> float:
+        """Farneback magnitude on the cached, downscaled grayscale pair."""
+        if self._gray_small is None or i <= 0:
+            return 0.0
+        try:
+            flow = cv2.calcOpticalFlowFarneback(
+                self._gray_small[i - 1], self._gray_small[i], None,
+                0.5, 3, 15, 3, 5, 1.2, 0,
+            )
+            mag = np.sqrt(flow[..., 0] ** 2 + flow[..., 1] ** 2).mean()
+            return min(1.0, float(mag) / 20.0)
+        except Exception:
+            return 0.0
+
+    def _text_region_score_cached(self, i: int) -> float:
+        if self._gray_small is None:
+            return 0.0
+        return self._text_region_score_gray(self._gray_small[i])
 
     def _histogram_diff(self, a: np.ndarray, b: np.ndarray) -> float:
         def hist(img):
@@ -425,6 +525,13 @@ class HierarchicalSampler:
         return float(cv2.compareHist(hist(a), hist(b), cv2.HISTCMP_BHATTACHARYYA))
 
     def _text_region_score(self, img: np.ndarray) -> float:
+        """RGB entry point — kept for callers; delegates to the grayscale core."""
+        try:
+            return self._text_region_score_gray(cv2.cvtColor(img, cv2.COLOR_RGB2GRAY))
+        except Exception:
+            return 0.0
+
+    def _text_region_score_gray(self, gray: np.ndarray) -> float:
         """Heuristic on-screen-text density (0–1), biased to the lower third.
 
         Gradient → Otsu → horizontal morphological close groups character strokes
@@ -432,7 +539,6 @@ class HierarchicalSampler:
         text. Captions/lower-thirds (bottom 40%) are up-weighted. Cheap enough to
         run per coarse (~1fps) frame; returns 0.0 on any failure."""
         try:
-            gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
             h, w = gray.shape
             scale = 320.0 / max(1, w)
             if scale < 1.0:
@@ -492,10 +598,13 @@ class HierarchicalSampler:
         scene_start = 0
         boundaries: List[Scene] = []
 
+        have_cache = self._hist is not None and len(self._hist) == len(frames)
         for i in range(1, len(frames)):
-            curr_img = np.array(frames[i].image)
-            prev_img = np.array(frames[i - 1].image)
-            hist_dist = self._histogram_diff(curr_img, prev_img)
+            if have_cache:
+                hist_dist = self._histogram_diff_cached(i, i - 1)
+            else:
+                hist_dist = self._histogram_diff(
+                    np.array(frames[i].image), np.array(frames[i - 1].image))
 
             emb_dist = 0.0
             if embeddings is not None:

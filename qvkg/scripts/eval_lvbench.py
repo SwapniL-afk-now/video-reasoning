@@ -109,6 +109,12 @@ def main():
                         help="Use two-stage QA: planner call → context assembly → answerer call")
     parser.add_argument("--react",         action="store_true", default=False,
                         help="Use ReAct agent (Thought/Action/Observation loop, plain-text actions)")
+    parser.add_argument("--walker",        action="store_true", default=False,
+                        help="Use inference-time agentic graph traversal (warrant-gated walker)")
+    parser.add_argument("--max-hops",      type=int, default=4,
+                        help="Max traversal hops per question in walker mode (default 4)")
+    parser.add_argument("--theta-cov",     type=float, default=1.0,
+                        help="Coverage threshold for the walker stop rule (default 1.0)")
     parser.add_argument("--max-turns",     type=int, default=6,
                         help="Max tool-call turns per question in agent/react mode (default 6)")
     parser.add_argument("--debug-dir",     type=str, default=None,
@@ -141,6 +147,7 @@ def main():
     from qvkg.query.agent import agent_answer_question
     from qvkg.query.two_stage import two_stage_answer_question, batch_two_stage_answer_questions
     from qvkg.query.react_agent import react_answer_question
+    from qvkg.query.walker import batch_walk_answer_questions
     from qvkg.schema import VKGraph
 
     total_done = 0
@@ -182,7 +189,38 @@ def main():
 
             vp = video_path if os.path.exists(video_path) else None
 
-            if args.react:
+            if args.walker:
+                # Inference-time agentic graph traversal, batched by hop.
+                print(f"  Walker mode: {len(pending)} questions "
+                      f"(max_hops={args.max_hops}, theta_cov={args.theta_cov})...")
+                batch_input = [
+                    {
+                        "question":       q["question"],
+                        "question_type":  parse_qt(q.get("question_type", "")),
+                        "time_reference": q.get("time_reference", "").strip() or None,
+                        "uid":            q["uid"],
+                    }
+                    for q in pending
+                ]
+                try:
+                    results = batch_walk_answer_questions(
+                        questions   = batch_input,
+                        graph       = graph,
+                        faiss_index = faiss_index,
+                        llm         = llm,
+                        siglip      = siglip,
+                        video_path  = vp,
+                        frame_store = frame_store,
+                        mcq         = True,
+                        debug_dir   = args.debug_dir,
+                        max_hops    = args.max_hops,
+                        theta_cov   = args.theta_cov,
+                    )
+                except Exception as e:
+                    import traceback; traceback.print_exc()
+                    print(f"  [ERR] walker batch failed: {e}")
+                    results = [None] * len(pending)
+            elif args.react:
                 # ReAct: Thought/Action/Observation loop with plain-text actions (serial)
                 print(f"  ReAct mode: {len(pending)} questions (max {args.max_turns} turns each)...")
                 results = []

@@ -107,6 +107,10 @@ def build_vkg(video_path: str, output_dir: str, args, siglip, llm, whisper_model
         "question_time_refs":    question_time_refs,
         "n_chunk_workers":       args.n_chunk_workers,
         "coarse_fps":            args.coarse_fps,
+        "coarse_frame_cap":      args.coarse_frame_cap,
+        "flow_max_dim":          args.flow_max_dim,
+        "use_optical_flow":      not args.no_optical_flow,
+        "whisper_compute_type":  args.whisper_compute_type,
     }
 
     builder = VKGBuilder(llm, whisper_model, siglip, config)
@@ -146,6 +150,7 @@ def eval_video(
     from qvkg.query.two_stage import batch_two_stage_answer_questions
     from qvkg.query.agent import agent_answer_question
     from qvkg.query.react_agent import react_answer_question
+    from qvkg.query.walker import batch_walk_answer_questions
 
     video_id   = os.path.splitext(video_filename)[0]
     vkg_path   = os.path.join(vkg_dir, video_id, "vkg.json")
@@ -169,7 +174,35 @@ def eval_video(
     video_type  = questions[0].get("type", "")
     vp = video_path if os.path.exists(video_path) else None
 
-    if args.react:
+    if args.walker:
+        batch_input = [
+            {
+                "question":      q["question"],
+                "question_type": parse_qt(q.get("question_type", "")),
+                "time_reference": q.get("time_reference", "").strip() or None,
+                "uid":           q["uid"],
+            }
+            for q in pending
+        ]
+        try:
+            results = batch_walk_answer_questions(
+                questions=batch_input,
+                graph=graph,
+                faiss_index=faiss_index,
+                llm=llm,
+                siglip=siglip,
+                video_path=vp,
+                frame_store=frame_store,
+                mcq=True,
+                max_hops=args.max_hops,
+                theta_cov=args.theta_cov,
+            )
+        except Exception as e:
+            import traceback; traceback.print_exc()
+            print(f"  [ERR] walker batch failed: {e}")
+            results = [None] * len(pending)
+
+    elif args.react:
         results = []
         for q in pending:
             try:
@@ -360,7 +393,7 @@ def main():
     parser.add_argument("--max-model-len",  type=int, default=65536)
     parser.add_argument("--min-pixels",     type=int, default=200704)
     parser.add_argument("--max-pixels",     type=int, default=1003520)
-    parser.add_argument("--whisper-model",  default="large-v3")
+    parser.add_argument("--whisper-model",  default="large-v3-turbo")
     parser.add_argument("--no-whisper",     action="store_true",
                         help="Disable Whisper transcription (default: Whisper ON)")
 
@@ -372,11 +405,23 @@ def main():
                         help="Parallel video chunks for frame extraction (default 8)")
     parser.add_argument("--coarse-fps",      type=float, default=1.0,
                         help="FPS for coarse frame extraction (default 1.0)")
+    parser.add_argument("--coarse-frame-cap", type=int, default=0,
+                        help="Cap on total coarse frames (0 = uncapped); tapers fps on long videos")
+    parser.add_argument("--flow-max-dim",    type=int, default=256,
+                        help="Downscale long-side px before optical flow (default 256)")
+    parser.add_argument("--no-optical-flow", action="store_true",
+                        help="Drop the motion term and renormalize keyframe-score weights")
+    parser.add_argument("--whisper-compute-type", default="int8_float16",
+                        help="faster-whisper compute_type (default int8_float16)")
 
     # QA mode
     parser.add_argument("--two-stage", action="store_true")
     parser.add_argument("--agent",     action="store_true")
     parser.add_argument("--react",     action="store_true")
+    parser.add_argument("--walker",    action="store_true",
+                        help="Inference-time agentic graph traversal (warrant-gated)")
+    parser.add_argument("--max-hops",  type=int, default=4)
+    parser.add_argument("--theta-cov", type=float, default=1.0)
     parser.add_argument("--max-turns", type=int, default=6)
 
     # Pipeline control
@@ -415,9 +460,11 @@ def main():
         try:
             import faster_whisper  # noqa: F401 — just verify it's installed
             whisper_model = types.SimpleNamespace(
-                _model_size=args.whisper_model
+                _model_size=args.whisper_model,
+                _compute_type=args.whisper_compute_type,
             )
-            print(f"Whisper {args.whisper_model} — will run in worker process")
+            print(f"Whisper {args.whisper_model} ({args.whisper_compute_type}) "
+                  f"— will run in worker process")
         except ImportError:
             print("  faster-whisper not installed — skipping audio")
 

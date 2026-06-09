@@ -37,8 +37,19 @@ def main():
     parser.add_argument("--out",            required=True, help="Output directory")
     parser.add_argument("--budget",         type=int, default=500, help="Keyframe budget")
     parser.add_argument("--model",          default="Qwen/Qwen3.5-4B")
-    parser.add_argument("--whisper-model",  default="large-v3")
+    parser.add_argument("--whisper-model",  default="large-v3-turbo",
+                        help="faster-whisper model size (default large-v3-turbo, ~8× faster)")
+    parser.add_argument("--whisper-compute-type", default="int8_float16",
+                        help="faster-whisper compute_type (default int8_float16)")
     parser.add_argument("--no-whisper",     action="store_true")
+    parser.add_argument("--coarse-fps",     type=float, default=1.0,
+                        help="FPS for coarse frame extraction (default 1.0)")
+    parser.add_argument("--coarse-frame-cap", type=int, default=0,
+                        help="Cap total coarse frames (0 = uncapped); tapers fps on long videos")
+    parser.add_argument("--flow-max-dim",   type=int, default=256,
+                        help="Downscale long-side px before optical flow (default 256)")
+    parser.add_argument("--no-optical-flow", action="store_true",
+                        help="Drop the motion term and renormalize keyframe-score weights")
     parser.add_argument("--tp",             type=int, default=1,
                         help="Tensor parallel size (GPUs)")
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.65,
@@ -95,14 +106,16 @@ def main():
 
     whisper_model = None
     if args.phase in ("all", "siglip") and not args.no_whisper:
-        print(f"Loading Whisper {args.whisper_model}...")
-        try:
-            from faster_whisper import WhisperModel
-            whisper_model = WhisperModel(
-                args.whisper_model, device="cuda", compute_type="float16"
-            )
-        except ImportError:
-            print("  faster-whisper not installed — skipping audio")
+        # The builder transcribes in an isolated worker process keyed by model
+        # size + compute type — pass those via a lightweight namespace rather
+        # than eagerly loading the model here (which the worker would re-load).
+        import types
+        whisper_model = types.SimpleNamespace(
+            _model_size=args.whisper_model,
+            _compute_type=args.whisper_compute_type,
+        )
+        print(f"Whisper {args.whisper_model} ({args.whisper_compute_type}) "
+              f"— will run in worker process")
 
     # Question-aware pre-sampling
     question_time_refs = []
@@ -120,6 +133,11 @@ def main():
         "question_time_refs":      question_time_refs,
         "video_type":              args.video_type,
         "subtitle_path":           args.subtitles,
+        "coarse_fps":              args.coarse_fps,
+        "coarse_frame_cap":        args.coarse_frame_cap,
+        "flow_max_dim":            args.flow_max_dim,
+        "use_optical_flow":        not args.no_optical_flow,
+        "whisper_compute_type":    args.whisper_compute_type,
     }
 
     from qvkg.builder import VKGBuilder

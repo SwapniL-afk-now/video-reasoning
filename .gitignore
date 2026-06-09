@@ -49,6 +49,9 @@ benchmarks/sonnet.txt
 .env.*
 !.env.example
 
+# W&B logs
+wandb/
+
 # IDE
 .idea/
 .vscode/
