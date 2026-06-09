@@ -16,11 +16,16 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Set
 
-from ..schema import AnswerResult, VKGNode, VKGraph
+from ..schema import AnswerResult, VKGEdge, VKGNode, VKGraph
 from ..vllm_client import (
+    BUILD_CAUSAL_SAMPLING,
+    BUILD_CAUSAL_SYSTEM,
+    OFFLINE_SAMPLING,
     WALKER_ANSWER_SAMPLING,
     WALKER_ANSWER_SYSTEM,
     WALKER_CONTROLLER_SYSTEM,
+    WALKER_PROBE_SAMPLING,
+    build_scene_system_prompt,
     extract_mcq_answer,
     walker_controller_sampling,
 )
@@ -32,10 +37,13 @@ from .actions import (
     WalkState,
     execute_action,
 )
+from .activator import SubgraphActivator
 from .frame_extractor import extract_frames_for_window, frames_to_b64_urls
-from .intent import parse_time_reference
+from .intent import classify_intent, parse_time_reference
 from .serializer import ContextSerializer
 from .verifier import verify
+
+MOTION_RANK_TYPES = {"sport", "live"}
 
 _SERIALIZER = ContextSerializer()
 _CONTROLLER_SAMPLING = walker_controller_sampling(ACTION_SCHEMA)
@@ -93,31 +101,42 @@ def seed_state(
     mcq: bool,
     seed_faiss_k: int = 12,
 ) -> WalkState:
-    """Build S_0 deterministically: entity nodes + time-window nodes + FAISS seeds."""
+    """Build S_0 using the same SubgraphActivator pipeline as one-shot.
+
+    Ports the full power of ``qa._build_prompt`` — intent-driven FAISS seeding,
+    typed BFS expansion (temporal spine, causal chains, entity threads, etc.),
+    temporal bucketing for wide windows, and confidence-ranked frame selection.
+    The result is an S_0 as rich as what one-shot sees in a single pass.
+    """
     question = q["question"]
     options = parse_options(question) if mcq else {}
     qtype = q.get("question_type") or []
     tr = parse_time_reference(q["time_reference"]) if q.get("time_reference") else None
 
-    node_ids: Set[str] = set()
+    intents = classify_intent(
+        question, siglip_encoder=siglip_encoder, question_types=qtype)
+    activator = SubgraphActivator(graph, faiss_index, siglip_encoder, max_nodes=80)
 
-    # 1) Entities named in the stem + options.
-    texts = [question] + list(options.values())
-    node_ids |= _resolve_entities(graph, texts)
-
-    # 2) Time-reference window nodes.
     if tr is not None:
         t0, t1 = tr
-        node_ids |= {n.id for n in graph.get_nodes_in_window(t0, t1, buffer_sec=15.0)}
+        # Temporal-range activation — does not require FAISS.
+        subgraph, _min_prec = activator.activate_by_time_reference(t0, t1, intents)
+    elif faiss_index is not None:
+        subgraph = activator.activate(question, intents)
+    else:
+        # No time reference and no FAISS index — activate() would dereference a
+        # None index. Seed from episodes / first nodes instead.
+        eps = graph.get_episodes()
+        seed_ids = {e.id for e in eps[:6]} or \
+                   {n.id for n in list(graph.nodes.values())[:20]}
+        subgraph = graph_ops.build_subgraph(graph, seed_ids)
 
-    # 3) Top-k FAISS hits for the stem.
-    node_ids |= set(graph_ops.faiss_search(
-        graph, faiss_index, siglip_encoder, question, k=seed_faiss_k))
-
-    # Fallback: if nothing seeded, take episodes / first nodes.
+    node_ids = set(subgraph.nodes.keys())
+    # Fallback: if still empty, grab first nodes.
     if not node_ids:
         eps = graph.get_episodes()
-        node_ids = {e.id for e in eps[:6]} or {n.id for n in list(graph.nodes.values())[:10]}
+        node_ids = {e.id for e in eps[:6]} or \
+                   {n.id for n in list(graph.nodes.values())[:10]}
 
     state = WalkState(
         qid=q.get("uid", question[:24]),
@@ -129,13 +148,60 @@ def seed_state(
         frontier=set(node_ids),
     )
 
-    # Seed frames from the time-reference window so entity/OCR questions start
-    # with visual evidence.
-    if tr is not None and video_path:
-        t0, t1 = tr
-        frames = extract_frames_for_window(video_path, t0, t1, max_frames=6)
-        state.add_frames(list(zip(frames_to_b64_urls(frames),
-                                  [f.timestamp for f in frames])))
+    # ---- Frame selection (ported from qa._build_prompt) ----
+    gap_threshold_sec = 8.0
+    max_keyframes = 8
+    motion_rank = any(vt in question.lower() for vt in ("sport", "live"))
+    t_start, t_end = tr if tr else (None, None)
+
+    window_sec = (t_end - t_start) if (t_start is not None and t_end is not None) else None
+    force_live = (window_sec is not None and window_sec <= 90.0 and video_path)
+
+    if t_start is not None and video_path and (window_sec is None or window_sec <= gap_threshold_sec or force_live):
+        live_frames = extract_frames_for_window(
+            video_path, t_start, t_end,
+            max_frames=max_keyframes, motion_rank=motion_rank)
+        urls_ts = list(zip(frames_to_b64_urls(live_frames),
+                           [f.timestamp for f in live_frames]))
+        state.add_frames(urls_ts)
+    else:
+        visual_nodes = subgraph.get_visual_nodes()
+
+        if window_sec and window_sec > 90.0 and t_start is not None and len(visual_nodes) > max_keyframes:
+            bucket_w = window_sec / max_keyframes
+            selected = []
+            for i in range(max_keyframes):
+                lo = t_start + i * bucket_w
+                hi = t_start + (i + 1) * bucket_w
+                bucket = [n for n in visual_nodes if lo <= n.t_start < hi and n.keyframe_id]
+                if bucket:
+                    selected.append(max(bucket, key=lambda n: n.confidence))
+            if len(selected) < max_keyframes:
+                qs = [n for n in visual_nodes
+                      if (n.keyframe_id or "").startswith("qs_") and n not in selected]
+                selected.extend(qs[:max_keyframes - len(selected)])
+            visual_nodes = selected[:max_keyframes]
+        else:
+            visual_nodes.sort(key=lambda n: -n.confidence)
+            visual_nodes = visual_nodes[:max_keyframes]
+
+        urls_ts = []
+        for n in visual_nodes:
+            if n.keyframe_id and frame_store is not None:
+                try:
+                    url = frame_store.get_b64_url(n.keyframe_id)
+                    urls_ts.append((url, n.t_start))
+                except Exception:
+                    pass
+        state.add_frames(urls_ts)
+
+        if not state.frames and t_start is not None and video_path:
+            live_frames = extract_frames_for_window(
+                video_path, t_start, t_end,
+                max_frames=max_keyframes, motion_rank=motion_rank)
+            urls_ts = list(zip(frames_to_b64_urls(live_frames),
+                               [f.timestamp for f in live_frames]))
+            state.add_frames(urls_ts)
 
     return state
 
@@ -165,6 +231,296 @@ def frame_to_text_summary(graph: VKGraph, timestamp: float,
             texts.append(n.canonical_description[:200])
     unique = list(dict.fromkeys(texts))
     return " | ".join(unique)[:600] if unique else "(no caption)"
+
+
+# ---------------------------------------------------------------------------
+# BUILD action — online KG construction
+# ---------------------------------------------------------------------------
+
+def _build_anchor(state: WalkState, graph: VKGraph, faiss_index,
+                  siglip_encoder) -> float:
+    """Find the best timestamp anchor for BUILD.
+
+    Priority: FAISS question search → CSV time_reference → frontier midpoint
+    → all-node midpoint → 0.
+    """
+    if faiss_index is not None:
+        from . import graph_ops
+        hits = graph_ops.faiss_search(graph, faiss_index, siglip_encoder,
+                                       state.question, k=3)
+        if hits:
+            ts = [graph.nodes[n].t_start for n in hits
+                  if n in graph.nodes and graph.nodes[n].t_start is not None]
+            if ts:
+                return sum(ts) / len(ts)
+    if state.time_reference:
+        return (state.time_reference[0] + state.time_reference[1]) / 2
+    frontier_ts = [graph.nodes[n].t_start for n in state.frontier
+                   if n in graph.nodes and graph.nodes[n].t_start is not None]
+    if frontier_ts:
+        return (min(frontier_ts) + max(frontier_ts)) / 2
+    all_ts = [graph.nodes[n].t_start for n in state.node_ids
+              if n in graph.nodes and graph.nodes[n].t_start is not None]
+    return sum(all_ts) / len(all_ts) if all_ts else 0.0
+
+
+def _build_params(gap_slot: str, multiplier: int) -> tuple:
+    """Return (radius_sec, n_frames) for a given gap slot and multiplier."""
+    params = {
+        "causal_edge":         (30.0, 8),
+        "entity_or_frame":     (10.0, 12),
+        "temporal_occurrences": (60.0, 6),
+        "mcq_option_coverage": (15.0, 8),
+        "episode_summary":     (90.0, 6),
+    }
+    radius, n_frames = params.get(gap_slot, (30.0, 8))
+    return radius * multiplier, min(n_frames * multiplier, 32)
+
+
+def _first_unfilled_gap_slot(state: WalkState) -> str:
+    if state.warrant and state.warrant.gap_slots:
+        return state.warrant.gap_slots[0]
+    return "entity_or_frame"
+
+
+_EVENT_TYPES_FOR_CAUSAL = {
+    "ActionNode", "InteractionNode", "StateChangeNode",
+    "SpeechNode", "SceneNode", "AudioEventNode",
+}
+
+
+def _build_causal_edges(state: WalkState, graph: VKGraph,
+                        llm, t0: float, t1: float) -> None:
+    """Infer missing causal edges among events in [t0, t1] via the LLM."""
+    nodes = [n for n in graph.get_nodes_in_window(t0, t1, buffer_sec=5.0)
+             if n.node_type in _EVENT_TYPES_FOR_CAUSAL]
+    nodes.sort(key=lambda n: n.t_start)
+    if len(nodes) < 2:
+        return
+
+    timeline = "\n".join(
+        f"  [{n.t_start:.0f}s] [{n.node_type}] "
+        f"{n.label or '(unnamed)'}"
+        f"{' — ' + n.canonical_description[:100] if n.canonical_description else ''}"
+        for n in nodes[:40]
+    )
+
+    user_msg = (
+        f"Question: {state.question}\n\n"
+        f"Video events at [{t0:.0f}s–{t1:.0f}s]:\n{timeline}\n\n"
+        "Identify causal cause→effect relationships between these events "
+        "that are relevant to answering the question above. "
+        "Use the exact event descriptions as cause/effect values."
+    )
+
+    out = llm.chat(
+        messages=[[
+            {"role": "system", "content": BUILD_CAUSAL_SYSTEM},
+            {"role": "user", "content": user_msg},
+        ]],
+        sampling_params=BUILD_CAUSAL_SAMPLING,
+        use_tqdm=False,
+    )
+
+    import json
+    try:
+        text = out[0].outputs[0].text
+        links = json.loads(text)
+    except Exception:
+        return
+
+    if not isinstance(links, list):
+        return
+
+    added = set()
+    touched: Set[str] = set()
+    for link in links:
+        if link.get("confidence", 0) < 0.6:
+            continue
+        cause_desc = (link.get("cause") or "").lower()
+        effect_desc = (link.get("effect") or "").lower()
+        cause_node = _match_event_description(nodes, cause_desc)
+        effect_node = _match_event_description(nodes, effect_desc)
+        if cause_node and effect_node and cause_node.id != effect_node.id:
+            key = (cause_node.id, effect_node.id, link.get("relation_type", "CAUSES"))
+            if key not in added:
+                graph.add_edge(VKGEdge(
+                    source_id=cause_node.id,
+                    target_id=effect_node.id,
+                    relation_type=link.get("relation_type", "CAUSES"),
+                    weight=link.get("confidence", 1.0),
+                    confidence=link.get("confidence", 1.0),
+                    metadata={
+                        "reasoning": link.get("reasoning", ""),
+                        "source": "build",
+                        "build_hop": state.hop,
+                    },
+                ))
+                added.add(key)
+                touched.add(cause_node.id)
+                touched.add(effect_node.id)
+
+    # The new edge is only visible to the induced subgraph (warrant, answerer,
+    # serializer) if BOTH endpoints are in the working set. Absorb them so the
+    # causal_edge slot can actually be filled and the elasticity probe can test
+    # whether they matter.
+    if touched:
+        state.absorb(touched)
+
+
+def _match_event_description(nodes: list, desc: str) -> Optional[VKGNode]:
+    """Fuzzy-match a description string to a node label/description."""
+    if not desc:
+        return None
+    desc_lower = desc.lower()
+    for n in nodes:
+        label = (n.label or "").lower().strip()
+        canon = (n.canonical_description or "").lower().strip()
+        # Guard against empty strings: `"" in desc_lower` is always True and
+        # would match the first node for every description, collapsing cause
+        # and effect onto the same node so no edge is ever built.
+        if label and (desc_lower in label or label in desc_lower):
+            return n
+        if canon and (desc_lower in canon or canon in desc_lower):
+            return n
+    # Word-level fallback
+    desc_words = set(w for w in re.findall(r"\b\w{4,}\b", desc_lower))
+    if not desc_words:
+        return None
+    best, best_score = None, 0
+    for n in nodes:
+        label = (n.label or "").lower()
+        canon = (n.canonical_description or "").lower()
+        text = label + " " + canon
+        words = set(w for w in re.findall(r"\b\w{4,}\b", text))
+        overlap = len(desc_words & words)
+        if overlap > best_score:
+            best_score = overlap
+            best = n
+    return best if best_score >= 2 else None
+
+
+def _perceive_window(state: WalkState, graph: VKGraph, video_path: str,
+                     llm, t0: float, t1: float, n_frames: int,
+                     video_type: str = "") -> int:
+    """Interactively perceive a raw-video window into NEW graph nodes.
+
+    Extracts frames from the raw video, runs the scene-extraction VLM on them,
+    and mints OCRNode / CharacterNode / ActionNode / StateChangeNode nodes —
+    then absorbs them so the warrant slot (entity_or_frame / mcq) can actually be
+    filled. This is the step that turns "look at the video" into queryable,
+    storable knowledge rather than transient pixels. Returns #nodes minted.
+    """
+    if not video_path:
+        return 0
+    frames = extract_frames_for_window(video_path, t0, t1,
+                                       max_frames=min(n_frames, 10),
+                                       motion_rank=True)
+    if not frames:
+        return 0
+    urls = frames_to_b64_urls(frames)
+    state.add_frames(list(zip(urls, [f.timestamp for f in frames])))
+
+    content: List[dict] = []
+    for url, fr in zip(urls, frames):
+        content.append({"type": "image_url", "image_url": {"url": url}})
+        content.append({"type": "text", "text": f"[t={fr.timestamp:.1f}s]"})
+    content.append({"type": "text",
+                    "text": "Extract structured information from these frames as JSON."})
+
+    try:
+        out = llm.chat(
+            messages=[[
+                {"role": "system", "content": build_scene_system_prompt(video_type)},
+                {"role": "user", "content": content},
+            ]],
+            sampling_params=OFFLINE_SAMPLING,
+            use_tqdm=False,
+        )
+        data = json.loads(out[0].outputs[0].text)
+    except Exception:
+        return 0
+
+    mid = (t0 + t1) / 2.0
+    minted: Set[str] = set()
+    idx = len(graph.nodes)
+
+    def _mint(kind: str, label: str, ts: float, **extra) -> None:
+        nonlocal idx
+        label = (label or "").strip()
+        if not label:
+            return
+        nid = f"build_h{state.hop}_{kind}_{idx}"
+        idx += 1
+        graph.add_node(VKGNode(
+            id=nid, node_type=kind, label=label[:200], level=0,
+            t_start=ts, t_end=ts,
+            metadata={"source": "build_perceive", "build_hop": state.hop, **extra},
+        ))
+        minted.add(nid)
+
+    for o in data.get("ocr_text", []) or []:
+        _mint("OCRNode", o.get("text", ""), mid)
+    for c in data.get("characters", []) or []:
+        _mint("CharacterNode", c.get("description", ""), mid,
+              emotion=c.get("emotion", ""))
+    for a in data.get("actions", []) or []:
+        ts = float(a.get("approx_timestamp", mid) or mid)
+        _mint("ActionNode", a.get("description", ""), ts,
+              actor=a.get("actor", ""))
+    for sc in data.get("state_changes", []) or []:
+        _mint("StateChangeNode",
+              f"{sc.get('entity','')}: {sc.get('from_state','')}→{sc.get('to_state','')}",
+              float(sc.get("approx_timestamp", mid) or mid))
+
+    if minted:
+        state.absorb(minted)
+    return len(minted)
+
+
+def _execute_build(state: WalkState, graph: VKGraph, faiss_index,
+                   siglip_encoder, video_path: str, llm, frame_store,
+                   video_type: str = "") -> None:
+    """Execute BUILD action — online KG construction for missing evidence.
+
+    Two modes:
+    - **Frame extraction** only if anchor timestamp not already covered by
+      existing frames (avoids adding noisy duplicates).
+    - **Causal edge inference** always runs for causal/temporal gap slots.
+
+    No subprocesses or multiprocessing workers are spawned.
+    """
+    # BUILD bypasses execute_action, which is what normally resets these — do it
+    # here so the elasticity ablation only removes nodes BUILD actually added.
+    state.last_ring = set()
+    state.stuck = False
+    anchor = _build_anchor(state, graph, faiss_index, siglip_encoder)
+    gap_slot = _first_unfilled_gap_slot(state)
+    radius, n_frames = _build_params(gap_slot, state.build_radius_multiplier)
+
+    t0 = max(0, anchor - radius)
+    t1 = anchor + radius
+
+    if gap_slot in ("entity_or_frame", "mcq_option_coverage"):
+        # Visual/identity gap → interactively perceive the window into NEW
+        # OCR/Character/Action nodes (also adds the frames for the answerer).
+        _perceive_window(state, graph, video_path, llm, t0, t1, n_frames,
+                         video_type=video_type)
+    else:
+        # Causal/temporal/episode gap → pull frames (for the answerer) and infer
+        # causal edges among the existing events in the window.
+        anchor_bucket = int(anchor // 10)
+        existing_buckets = {int(ts // 10) for _, ts in state.frames}
+        if anchor_bucket not in existing_buckets:
+            frames = extract_frames_for_window(
+                video_path, t0, t1, max_frames=n_frames, motion_rank=True)
+            state.add_frames(list(zip(frames_to_b64_urls(frames),
+                                      [f.timestamp for f in frames])))
+        _build_causal_edges(state, graph, llm, t0, t1)
+
+    # Bump expansion for next BUILD call
+    state.build_radius_multiplier *= 2
+    state.build_density *= 2
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +558,9 @@ def _controller_messages(state: WalkState, graph: VKGraph,
 
     frontier_preview = ", ".join(sorted(state.frontier)[:12]) or "(empty)"
     ans = state.current_answer or "(none yet)"
+    stuck = ""
+    if state.stuck:
+        stuck = "\n[STUCK] Last EXPAND added no new nodes. Try RECALL(query) instead — it searches the entire graph."
 
     content: List[dict] = []
 
@@ -227,6 +586,7 @@ def _controller_messages(state: WalkState, graph: VKGraph,
         f"## Missing evidence (gaps)\n{gap_text}\n\n"
         f"## Coverage so far\n{coverage:.2f}\n\n"
         f"## Your last tentative answer\n{ans}\n\n"
+        f"{stuck}\n"
         f"Choose ONE action (JSON)."})
 
     return [
@@ -288,19 +648,13 @@ def _forced_action(state: WalkState, graph: VKGraph) -> Dict[str, Any]:
     if "mcq_option_coverage" in slots and w and w.missing_options:
         return {"action": "DISCRIMINATE", "option": w.missing_options[0]}
     if "causal_edge" in slots:
-        return {"action": "EXPAND", "relation": "CAUSAL"}
+        return {"action": "BUILD"}
     if "temporal_occurrences" in slots:
         return {"action": "EXPAND", "relation": "ENTITY"}
     if "episode_summary" in slots:
         return {"action": "EXPAND", "relation": "CONTAINS"}
     if "entity_or_frame" in slots:
-        if state.frontier:
-            nid = sorted(
-                state.frontier,
-                key=lambda x: graph.nodes[x].t_start if x in graph.nodes else 0.0,
-            )[0]
-            return {"action": "ZOOM", "node_id": nid}
-        return {"action": "EXPAND", "relation": "ENTITY"}
+        return {"action": "BUILD"}
     return {"action": "RECALL", "query": state.question}
 
 
@@ -398,9 +752,15 @@ def batch_walk_answer_questions(
         # ---- 2) Resolve each action (verify ANSWER / STOP, else execute). ----
         for st, action in zip(live_states, actions):
             st.hop = hop
+            st.last_action = action
             name = (action.get("action") or "").upper()
 
-            if name == "ANSWER":
+            if name == "BUILD":
+                st.history.append({"hop": hop, "action": "BUILD"})
+                _execute_build(st, graph, faiss_index, siglip,
+                               video_path, llm, frame_store)
+                continue
+            elif name == "ANSWER":
                 letter = (action.get("letter") or "").upper()
                 cited = action.get("cited_node_ids") or []
                 sub = _subgraph_of(graph, st.node_ids)
@@ -418,6 +778,7 @@ def batch_walk_answer_questions(
                 # Rejected / not yet warranted → forced backtrack toward a gap.
                 action = _forced_action(st, graph)
                 st.forced_action = action
+                st.last_action = {"forced_from": "ANSWER", **action}
             elif name == "STOP_REQUEST":
                 st.history.append({"hop": hop, "action": "STOP_REQUEST"})
                 if st.warrant and st.warrant.satisfied:
@@ -427,6 +788,7 @@ def batch_walk_answer_questions(
                     continue
                 action = _forced_action(st, graph)
                 st.forced_action = action
+                st.last_action = {"forced_from": "STOP_REQUEST", **action}
             else:
                 st.history.append({"hop": hop, "action": name,
                                    "args": {k2: v for k2, v in action.items()
@@ -436,6 +798,9 @@ def batch_walk_answer_questions(
                            frame_store, video_path, k=k)
 
         # ---- 3) Answerer read-outs (full + ablated), batched. ----
+        # Both are GREEDY (WALKER_PROBE_SAMPLING) so the elasticity comparison is
+        # a true deterministic finite difference, not two noisy temp>0 draws. The
+        # high-temperature thinking answer is generated once, at emission (below).
         pending = [s for s in live_states if not s.done]
         if not pending:
             continue
@@ -443,23 +808,28 @@ def batch_walk_answer_questions(
         full_msgs = [_answerer_messages(s, graph, s.node_ids) for s in pending]
         full_out = llm.chat(
             messages=full_msgs,
-            sampling_params=WALKER_ANSWER_SAMPLING,
+            sampling_params=WALKER_PROBE_SAMPLING,
             chat_template_kwargs={"enable_thinking": mcq},
             use_tqdm=False,
         )
         for s, o in zip(pending, full_out):
+            s.prev_answer = s.current_answer
             s.current_answer = extract_mcq_answer(o.outputs[0].text) if mcq \
                 else o.outputs[0].text.strip()
 
         # Ablated probe — only for states whose last action added a ring.
+        # States whose action added NO ring get no free pass: their elasticity
+        # falls back to answer stability across hops (prev vs current), which is
+        # None→elastic at hop 0. Defaulting to current_answer here made
+        # elasticity trivially 0 and retired states at hop 0 untested.
         ablate = [s for s in pending if s.last_ring]
-        ablated_answers: Dict[str, Optional[str]] = {s.qid: s.current_answer for s in pending}
+        ablated_answers: Dict[str, Optional[str]] = {s.qid: s.prev_answer for s in pending}
         if ablate:
             ab_msgs = [_answerer_messages(s, graph, s.node_ids - s.last_ring)
                        for s in ablate]
             ab_out = llm.chat(
                 messages=ab_msgs,
-                sampling_params=WALKER_ANSWER_SAMPLING,
+                sampling_params=WALKER_PROBE_SAMPLING,
                 chat_template_kwargs={"enable_thinking": mcq},
                 use_tqdm=False,
             )
@@ -489,7 +859,7 @@ def batch_walk_answer_questions(
                 mcq=mcq, theta_cov=theta_cov,
                 discriminated=s.discriminated,
             )
-            _log_hop(debug_dir, _hop_record(s, None, None, None))
+            _log_hop(debug_dir, _hop_record(s, s.last_action, None, None))
             if s.warrant.satisfied:
                 s.final_answer = s.current_answer
                 # Capture citations from a verified ANSWER for this letter, if any.
@@ -500,6 +870,26 @@ def batch_walk_answer_questions(
                         s.cited_node_ids = h.get("cited", [])
                         break
                 s.done = True
+
+    # ---- Final emission pass: full-thinking-budget greedy answer. ----
+    # Only for states the walk did NOT retire (hop cap reached without a
+    # satisfied warrant). States that converged — warrant-satisfied or
+    # citation-verified — keep the answer the walk certified; re-answering them
+    # here was overwriting converged-correct letters.
+    final_states = [s for s in states if s.final_answer is None]
+    if final_states:
+        fin_msgs = [_answerer_messages(s, graph, s.node_ids) for s in final_states]
+        fin_out = llm.chat(
+            messages=fin_msgs,
+            sampling_params=WALKER_ANSWER_SAMPLING,
+            chat_template_kwargs={"enable_thinking": mcq},
+            use_tqdm=False,
+        )
+        for s, o in zip(final_states, fin_out):
+            ans = extract_mcq_answer(o.outputs[0].text) if mcq \
+                else o.outputs[0].text.strip()
+            if ans:
+                s.final_answer = ans
 
     # Emit: verified/satisfied answer, else current read-out (lowest-risk).
     results: List[AnswerResult] = []

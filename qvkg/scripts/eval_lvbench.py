@@ -20,7 +20,76 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+import wandb
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+WANDB_RUN_ID_FILE = "/workspace/.wandb_run_id"
+
+def _wandb_load_run_id():
+    if os.path.exists(WANDB_RUN_ID_FILE):
+        with open(WANDB_RUN_ID_FILE) as f:
+            return f.read().strip()
+    return None
+
+def _wandb_save_run_id(rid: str):
+    os.makedirs(os.path.dirname(WANDB_RUN_ID_FILE), exist_ok=True)
+    with open(WANDB_RUN_ID_FILE, "w") as f:
+        f.write(rid)
+
+def _wandb_init():
+    rid = _wandb_load_run_id()
+    if rid is None:
+        run = wandb.init(project="LVBench-eval", name="full-run")
+        _wandb_save_run_id(run.id)
+    else:
+        run = wandb.init(project="LVBench-eval", id=rid, resume="must")
+    return run
+
+def _wandb_log_video(video_id: str, results: list[dict], duration_sec: float | None = None):
+    vr = [r for r in results if r.get("video", "").replace(".mp4", "") == video_id]
+    if not vr:
+        return
+    correct = sum(1 for r in vr if r["correct"])
+    total = len(vr)
+    acc = correct / total if total > 0 else 0
+    log = {
+        f"per_video/{video_id}/correct": correct,
+        f"per_video/{video_id}/total": total,
+        f"per_video/{video_id}/accuracy": acc,
+    }
+    if duration_sec is not None:
+        log[f"per_video/{video_id}/duration_sec"] = duration_sec
+    try:
+        import torch
+        log[f"per_video/{video_id}/gpu_mem_gb"] = torch.cuda.max_memory_allocated() / 1e9
+    except Exception:
+        pass
+    wandb.log(log)
+
+def _wandb_log_overall(all_results: list[dict]):
+    overall_correct = sum(1 for r in all_results if r["correct"])
+    overall_total = len(all_results)
+    overall_acc = overall_correct / overall_total if overall_total > 0 else 0
+
+    by_qt: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+    for r in all_results:
+        for qt in r.get("question_types", []):
+            by_qt[qt][1] += 1
+            if r["correct"]:
+                by_qt[qt][0] += 1
+
+    log = {
+        "overall/correct": overall_correct,
+        "overall/total": overall_total,
+        "overall/accuracy": overall_acc,
+    }
+    for qt, (corr, tot) in sorted(by_qt.items()):
+        if tot > 0:
+            log[f"per_type/{qt}/correct"] = corr
+            log[f"per_type/{qt}/total"] = tot
+            log[f"per_type/{qt}/accuracy"] = corr / tot
+    wandb.log(log)
 
 
 def load_questions(csv_path: str) -> Dict[str, List[dict]]:
@@ -112,9 +181,9 @@ def main():
     parser.add_argument("--walker",        action="store_true", default=False,
                         help="Use inference-time agentic graph traversal (warrant-gated walker)")
     parser.add_argument("--max-hops",      type=int, default=4,
-                        help="Max traversal hops per question in walker mode (default 4)")
-    parser.add_argument("--theta-cov",     type=float, default=1.0,
-                        help="Coverage threshold for the walker stop rule (default 1.0)")
+                        help="Max traversal hops per question in walker mode")
+    parser.add_argument("--theta-cov",     type=float, default=0.75,
+                        help="Coverage threshold for the walker stop rule (default 0.75)")
     parser.add_argument("--max-turns",     type=int, default=6,
                         help="Max tool-call turns per question in agent/react mode (default 6)")
     parser.add_argument("--debug-dir",     type=str, default=None,
@@ -152,6 +221,10 @@ def main():
 
     total_done = 0
     out_f = open(args.out, "a")
+
+    wandb_run = _wandb_init()
+    import time as _time
+    _video_start = _time.time()
 
     try:
         for video_filename, questions in questions_by_video.items():
@@ -354,6 +427,11 @@ def main():
                       f"[{', '.join(qt)}] t={time_ref}")
 
             total_done += len(pending)
+
+            duration = _time.time() - _video_start
+            _wandb_log_video(video_id, all_results, duration)
+            _video_start = _time.time()
+
             if args.limit and total_done >= args.limit:
                 break
 
@@ -361,6 +439,8 @@ def main():
         out_f.close()
 
     if all_results:
+        _wandb_log_overall(all_results)
+        wandb_run.finish()
         print_accuracy_report(all_results)
     else:
         print("No new questions evaluated.")

@@ -21,13 +21,14 @@ MAX_IMAGE_FRAMES_PER_PROMPT: int = 10  # Qwen's 10-image-per-turn limit
 # Action JSON schema (constrained decode)
 # ---------------------------------------------------------------------------
 
-ACTION_NAMES = ["EXPAND", "ZOOM", "DISCRIMINATE", "RECALL", "ANSWER", "STOP_REQUEST"]
+ACTION_NAMES = ["EXPAND", "ZOOM", "DISCRIMINATE", "RECALL", "ANSWER", "STOP_REQUEST", "BUILD"]
 
 ACTION_SCHEMA = {
     "type": "object",
     "required": ["action"],
     "properties": {
-        "action": {"type": "string", "enum": ACTION_NAMES},
+        "action": {"type": "string", "enum": ACTION_NAMES,
+               "description": "BUILD: online KG construction for the window where evidence is missing. No params."},
         "relation": {
             "type": "string",
             "enum": list(graph_ops.VALID_RELATIONS),
@@ -88,11 +89,16 @@ class WalkState:
     frame_archive: List[str] = field(default_factory=list)
 
     current_answer: Optional[str] = None
+    prev_answer: Optional[str] = None        # previous hop's read-out (elasticity fallback)
+    last_action: Optional[Dict[str, Any]] = None  # resolved action this hop (debug)
     cited_node_ids: List[str] = field(default_factory=list)
     discriminated: Set[str] = field(default_factory=set)  # MCQ options already probed
 
     warrant: Any = None                      # query.warrant.Warrant
     forced_action: Optional[Dict[str, Any]] = None  # backtrack target
+    stuck: bool = False               # true when last EXPAND added no new nodes
+    build_radius_multiplier: int = 1  # doubles each BUILD call
+    build_density: int = 1            # doubles each BUILD call
     done: bool = False
     final_answer: Optional[str] = None
 
@@ -157,6 +163,7 @@ def execute_action(
     """
     name = (action.get("action") or "").upper()
     state.last_ring = set()
+    state.stuck = False
 
     if name == "EXPAND":
         relation = action.get("relation") or "CAUSAL"
@@ -165,6 +172,7 @@ def execute_action(
         ring = state.absorb(new_ids)
         # Newly reached nodes become the next frontier.
         state.frontier = ring or state.frontier
+        state.stuck = not bool(ring)
 
     elif name == "ZOOM":
         node_id = action.get("node_id")

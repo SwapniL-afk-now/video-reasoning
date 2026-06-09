@@ -613,16 +613,25 @@ MCQ_REASONING_SAMPLING = SamplingParams(
 # Walker (inference-time agentic graph traversal) sampling + prompts
 # ---------------------------------------------------------------------------
 
-# Answerer / elasticity read-out. Kept at the original MCQ thinking budget
-# (temperature + 8192-token cap) — the model reasons freely inside <think>…</think>
-# before emitting the answer letter.
+# Answerer / final emission read-out. GREEDY: the walk's convergence signal
+# (elasticity) is computed over greedy probes, so the emitted answer must come
+# from the same deterministic distribution — a temp-1.0 final pass can flip a
+# converged correct answer on sampling noise. Thinking budget kept at 8192.
 WALKER_ANSWER_SAMPLING = SamplingParams(
-    temperature=1.0,
-    top_p=0.95,
-    top_k=20,
-    min_p=0.0,
-    presence_penalty=1.5,
+    temperature=0.0,
+    top_p=1.0,
     max_tokens=8192,
+)
+
+
+# Internal convergence probe: GREEDY so the elasticity finite difference
+# (answer(S_full) vs answer(S∖last_ring)) is deterministic — comparing two
+# temperature>0 draws would flip on sampling noise, not on evidence. Thinking is
+# kept (capped) so the probe still reasons; only the randomness is removed.
+WALKER_PROBE_SAMPLING = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    max_tokens=2048,
 )
 
 
@@ -638,34 +647,85 @@ def walker_controller_sampling(action_schema: dict) -> SamplingParams:
 
 WALKER_CONTROLLER_SYSTEM = (
     "You are navigating a video knowledge graph to answer a question. "
-    "You see frames from the video, the current sub-graph (nodes with ids + "
-    "explicit edges), and a list of missing evidence (gaps). Use the frames "
-    "to visually verify where evidence is lacking before choosing an action. "
-    "Choose EXACTLY ONE action to fill the largest "
-    "gap, or ANSWER with citations once every gap is filled.\n\n"
+    "You see frames from the video, the current sub-graph, and missing evidence "
+    "gaps. Be concise — pick ONE action that fills the largest gap fastest.\n\n"
+    "Two search modes:\n"
+    "- EXPAND(relation): follow graph edges from current frontier. "
+    "Use when you know the evidence is nearby.\n"
+    "- RECALL(query): semantic search over the entire graph (bypasses topology). "
+    "Use when EXPAND finds nothing new or evidence may be anywhere.\n\n"
     "Actions:\n"
-    "- EXPAND(relation): follow an edge family from the frontier. "
+    "- EXPAND(relation): follow an edge family. "
     "relation ∈ {CAUSAL, ENTITY, SPEAKER, TEMPORAL, EMOTION, SIMILAR, CONTAINS}.\n"
-    "- ZOOM(node_id): materialise frames + fine detail at a node.\n"
-    "- DISCRIMINATE(option): retrieve evidence separating an MCQ option (A/B/C/D) "
-    "from rivals.\n"
-    "- RECALL(query): semantic search when the frontier is exhausted.\n"
-    "- ANSWER(letter, cited_node_ids): answer with the node ids that support it.\n"
-    "- STOP_REQUEST: you believe you are done (still gated by the verifier).\n\n"
-    "Look at the frames before deciding. If you can see visual evidence for a "
-    "specific option directly, favour ANSWER over further exploration. "
-    "Prefer EXPAND/DISCRIMINATE that target a named gap. Output one JSON action."
+    "- ZOOM(node_id): materialise frames at a node.\n"
+    "- DISCRIMINATE(option): retrieve evidence for an MCQ option.\n"
+    "- RECALL(query): semantic search (topology-free — reaches any node).\n"
+    "- BUILD: extract fresh frames + infer missing edges at the question's "
+    "location. Use when:\n"
+    "  * Gaps persist despite EXPAND/RECALL (stuck)\n"
+    "  * Causal edges are missing — BUILD infers them from existing scene labels\n"
+    "  * Entity evidence is missing — BUILD extracts denser frames at the anchor\n"
+    "- ANSWER(letter, cited_node_ids): answer with supporting node ids.\n"
+    "- STOP_REQUEST: you believe you are done.\n\n"
+    "Do NOT over-explore. Once you have enough evidence to pick an answer, "
+    "ANSWER immediately. Output one JSON action."
 )
 
 WALKER_ANSWER_SYSTEM = (
     "You are a video analyst answering a multiple choice question. "
     "You are given frames and a knowledge sub-graph with explicit edges "
     "(causal chains, same-entity threads, speaker links).\n\n"
-    "Reason over the explicit edges, the timeline, and the frames. "
-    "Prefer narration and on-screen text (OCR) over visual guesses. "
-    "Evaluate each option (A, B, C, D) against the cited evidence.\n\n"
-    "After brief reasoning, output ONE line containing ONLY the answer letter: "
+    "Think carefully and thoroughly inside your thinking block: examine each "
+    "frame, review the timeline and characters, then evaluate each option "
+    "(A, B, C, D) against the evidence — timestamps, visual details, "
+    "dialogue, and OCR text.\n\n"
+    "After your thinking, output ONE line containing ONLY the answer letter: "
     "A, B, C, or D."
+)
+
+# ---------------------------------------------------------------------------
+# BUILD action — online KG construction prompts
+# ---------------------------------------------------------------------------
+
+BUILD_CAUSAL_SYSTEM = (
+    "You are a causal reasoning engine for video event analysis. "
+    "Given a timeline of timestamped events from a video, identify causal "
+    "cause→effect relationships.\n\n"
+    "Rules:\n"
+    "- Only link events that have a clear causal relationship.\n"
+    "- A cause must precede its effect in time.\n"
+    "- Use CAUSES for direct cause-effect, ENABLES for precondition, "
+    "PREVENTS for blocking, MOTIVATES for psychological drive.\n"
+    "- Assign confidence (0.0–1.0) based on how certain the link is.\n"
+    "- Provide brief reasoning for each link.\n\n"
+    "Output a JSON array of objects with fields:\n"
+    "cause (string), effect (string), relation_type (CAUSES|ENABLES|PREVENTS|MOTIVATES), "
+    "confidence (float), reasoning (string)."
+)
+
+BUILD_CAUSAL_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["cause", "effect", "relation_type", "confidence", "reasoning"],
+        "properties": {
+            "cause": {"type": "string", "description": "Description of the cause event"},
+            "effect": {"type": "string", "description": "Description of the effect event"},
+            "relation_type": {
+                "type": "string",
+                "enum": ["CAUSES", "ENABLES", "PREVENTS", "MOTIVATES"]
+            },
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "reasoning": {"type": "string"}
+        }
+    }
+}
+
+BUILD_CAUSAL_SAMPLING = SamplingParams(
+    temperature=0.0,
+    top_p=1.0,
+    max_tokens=1024,
+    structured_outputs=StructuredOutputsParams(json=BUILD_CAUSAL_SCHEMA),
 )
 
 MCQ_SYSTEM_PROMPT = (
