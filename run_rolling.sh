@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# run_rolling.sh — Batch download → build VKG → eval → delete pipeline
-# Downloads BATCH_SIZE videos in parallel, processes them one by one on GPU,
-# deletes everything after eval (keeps only results_all.jsonl).
+# run_rolling.sh — Download → build VKG → eval → delete, rolling over all videos in CSV.
 # Idempotent: safe to kill and restart at any point.
+# Each video is fully deleted after eval to reclaim disk space.
 
 set -euo pipefail
 
 # ─── Configuration ────────────────────────────────────────────────────────────
-CSV="/workspace/LVBench_full.csv"
-OUT="/workspace/output_4b"
-VIDEOS="/workspace/videos"
-RESULTS="$OUT/results_all.jsonl"
+CSV="${CSV:-/workspace/LVBench_full.csv}"
+OUT="${OUT:-/workspace/vkgs}"
+VIDEO_DIR="${VIDEO_DIR:-/workspace/videos}"
+RESULTS="${RESULTS:-/workspace/results_all.jsonl}"
 DONE_FILE="$OUT/done_videos.txt"
-MODEL="Qwen/Qwen3.5-4B"
-GPU_UTIL=0.70
+MODEL="${MODEL:-/workspace/models/Qwen3.5-4B}"
+GPU_UTIL="0.75"
+N_WORKERS="8"          # parallel frame-extraction chunks (fixed)
+WHISPER_MODEL="large-v3"
 LOG="$OUT/run_rolling.log"
-BATCH_SIZE=8   # parallel downloads per batch
+BATCH_SIZE="${BATCH_SIZE:-4}"   # videos to download in parallel per batch
 
-# Videos currently being processed by run_timed.sh — never touch these
+# Videos to skip (already being handled separately)
 IN_PROGRESS=("KktLi3UifPY" "JTa_Ue2MSwc")
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -25,27 +26,25 @@ IN_PROGRESS=("KktLi3UifPY" "JTa_Ue2MSwc")
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
 
 wait_gpu_free() {
-    log "  [gpu] Waiting for GPU memory to free up (>80 GB) before vLLM..."
+    log "  [gpu] Waiting for GPU to free up (>80 GB)..."
     until python3 -c "
 import subprocess, sys
 r = subprocess.run(['nvidia-smi','--query-gpu=memory.free','--format=csv,noheader,nounits'], capture_output=True, text=True)
-free_mib = int(r.stdout.strip())
-sys.exit(0 if free_mib > 81920 else 1)
-" 2>/dev/null; do sleep 3; done
+sys.exit(0 if int(r.stdout.strip()) > 81920 else 1)
+" 2>/dev/null; do sleep 5; done
     log "  [gpu] GPU ready."
 }
 
 get_all_vids() {
     python3 -c "
 import csv
-seen = []
+seen, out = [], []
 with open('$CSV') as f:
     for r in csv.DictReader(f):
-        vid = r['video_path'].replace('.mp4','')
-        if vid not in seen:
-            seen.append(vid)
-for v in seen:
-    print(v)
+        v = r['video_path'].replace('.mp4','')
+        if v not in seen:
+            seen.append(v); out.append(v)
+for v in out: print(v)
 "
 }
 
@@ -54,8 +53,7 @@ is_fully_evaluated() {
     python3 -c "
 import csv, json, sys
 uids = [r['uid'] for r in csv.DictReader(open('$CSV')) if r['video_path'].replace('.mp4','') == '$vid']
-if not uids:
-    sys.exit(0)
+if not uids: sys.exit(0)
 try:
     answered = {json.loads(l)['uid'] for l in open('$RESULTS') if l.strip()}
 except FileNotFoundError:
@@ -64,88 +62,7 @@ sys.exit(0 if all(u in answered for u in uids) else 1)
 "
 }
 
-is_vkg_built() { [[ -f "$OUT/$1/vkg.json" ]]; }
-
-download_video() {
-    local vid="$1"
-    local dest="$VIDEOS/$vid.mp4"
-    if [[ -f "$dest" ]]; then
-        log "  [download] $vid already present, skipping."
-        return 0
-    fi
-    log "  [download] Starting $vid ..."
-    yt-dlp \
-        -f "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec!=av01][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
-        --merge-output-format mp4 \
-        --no-part \
-        --socket-timeout 60 \
-        --retries 3 \
-        -o "$dest" \
-        "https://www.youtube.com/watch?v=$vid" \
-        >> "$OUT/download_${vid}.log" 2>&1
-}
-
-build_siglip_phase() {
-    local vid="$1"
-    # Skip if both step1 and step2 already checkpointed
-    if [[ -f "$OUT/$vid/.ckpt_step1_sampled" && -f "$OUT/$vid/.ckpt_step2_transcribed" ]]; then
-        log "  [siglip] $vid already checkpointed, skipping."
-        return 0
-    fi
-    log "  [siglip] Running SigLIP+Whisper phase for $vid ..."
-    mkdir -p "$OUT/$vid"
-    python3 /workspace/qvkg/scripts/build_vkg.py \
-        --video "$VIDEOS/$vid.mp4" \
-        --out "$OUT" \
-        --questions-csv "$CSV" \
-        --model "$MODEL" \
-        --gpu-memory-utilization "$GPU_UTIL" \
-        --phase siglip \
-        >> "$OUT/build_${vid}.log" 2>&1
-}
-
-build_llm_phase() {
-    local vid="$1"
-    if is_vkg_built "$vid"; then
-        log "  [llm] VKG already present for $vid, skipping."
-        return 0
-    fi
-    log "  [llm] Running LLM phase for $vid ..."
-    python3 /workspace/qvkg/scripts/build_vkg.py \
-        --video "$VIDEOS/$vid.mp4" \
-        --out "$OUT" \
-        --questions-csv "$CSV" \
-        --model "$MODEL" \
-        --gpu-memory-utilization "$GPU_UTIL" \
-        --phase llm \
-        2>&1 | tee -a "$OUT/build_${vid}.log"
-}
-
-eval_video() {
-    local vid="$1"
-    log "  [eval] Evaluating $vid ..."
-    python3 /workspace/qvkg/scripts/eval_lvbench.py \
-        --csv "$CSV" \
-        --vkg-dir "$OUT" \
-        --video-dir "$VIDEOS" \
-        --out "$RESULTS" \
-        --two-stage \
-        --model "$MODEL" \
-        --gpu-memory-utilization "$GPU_UTIL" \
-        2>&1 | tee "$OUT/eval_${vid}.log"
-}
-
-cleanup_video() {
-    local vid="$1"
-    log "  [cleanup] Removing all artifacts for $vid ..."
-    rm -f  "$VIDEOS/$vid.mp4"
-    rm -rf "$OUT/$vid"
-    rm -f  "$OUT/build_${vid}.log" "$OUT/eval_${vid}.log" "$OUT/download_${vid}.log"
-    rm -rf "$OUT/debug_${vid}"
-}
-
 free_gb() { df -BG /workspace | awk 'NR==2{gsub("G",""); print $4}'; }
-
 mark_done() { grep -qxF "$1" "$DONE_FILE" 2>/dev/null || echo "$1" >> "$DONE_FILE"; }
 
 print_accuracy() {
@@ -159,38 +76,58 @@ print(f'  Running accuracy: {c}/{len(rows)} = {100*c/len(rows):.1f}%')
 "
 }
 
+download_video() {
+    local vid="$1"
+    local dest="$VIDEO_DIR/$vid.mp4"
+    [[ -f "$dest" ]] && { log "  [download] $vid already present."; return 0; }
+    log "  [download] $vid ..."
+    yt-dlp \
+        -f "bestvideo[vcodec^=avc][ext=mp4]+bestaudio[ext=m4a]/bestvideo[vcodec!=av01][ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" \
+        --merge-output-format mp4 \
+        --no-part \
+        --socket-timeout 60 \
+        --retries 3 \
+        -o "$dest" \
+        "https://www.youtube.com/watch?v=$vid" \
+        >> "$OUT/download_${vid}.log" 2>&1
+}
+
 process_video() {
     local vid="$1"
-    local T0
-    T0=$(date +%s)
-    log "━━━ Processing: $vid ━━━  (free: $(free_gb) GB)"
+    local T0; T0=$(date +%s)
+    log "━━━ $vid — build + eval  (disk: $(free_gb) GB) ━━━"
 
-    local BUILD_OK=true
-    if ! build_llm_phase "$vid"; then
-        log "  [ERROR] LLM phase failed for $vid."
-        BUILD_OK=false
-    fi
+    python3 /workspace/video-reasoning/qvkg/scripts/run_pipeline.py \
+        --csv            "$CSV" \
+        --video-dir      "$VIDEO_DIR" \
+        --out            "$OUT" \
+        --results        "$RESULTS" \
+        --model          "$MODEL" \
+        --gpu-memory-utilization "$GPU_UTIL" \
+        --n-chunk-workers "$N_WORKERS" \
+        --whisper-model  "$WHISPER_MODEL" \
+        2>&1 | tee "$OUT/run_${vid}.log" \
+    && mark_done "$vid"
 
-    if $BUILD_OK; then
-        if ! eval_video "$vid"; then
-            log "  [ERROR] eval failed for $vid (results may be partial)."
-        fi
-    fi
-
-    cleanup_video "$vid"
-    $BUILD_OK && mark_done "$vid"
-
-    local T1
-    T1=$(date +%s)
-    log "  Wall time for $vid: $((T1 - T0))s"
+    local T1; T1=$(date +%s)
+    log "  Wall time: $((T1 - T0))s"
     print_accuracy
+}
+
+cleanup_video() {
+    local vid="$1"
+    log "  [cleanup] $vid — removing video + VKG..."
+    rm -f  "$VIDEO_DIR/$vid.mp4"
+    rm -rf "$OUT/$vid"
+    rm -f  "$OUT/run_${vid}.log" "$OUT/download_${vid}.log"
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
-mkdir -p "$OUT" "$VIDEOS"
+mkdir -p "$OUT" "$VIDEO_DIR"
 touch "$DONE_FILE"
 log "=== run_rolling.sh starting ==="
+log "CSV: $CSV  |  workers=$N_WORKERS  |  whisper=$WHISPER_MODEL  |  gpu_util=$GPU_UTIL"
 log "Free disk: $(free_gb) GB  |  batch_size=$BATCH_SIZE"
 
 declare -A SKIP
@@ -202,35 +139,22 @@ log "Total videos in CSV: ${#ALL_VIDS[@]}"
 ALREADY_HAVE=()
 NEED_DOWNLOAD=()
 for vid in "${ALL_VIDS[@]}"; do
-    [[ -n "${SKIP[$vid]+x}" ]] && { log "  [skip] $vid — currently in progress."; continue; }
-    if is_fully_evaluated "$vid"; then
-        log "  [skip] $vid — already fully evaluated."
-        continue
-    fi
-    if [[ -f "$VIDEOS/$vid.mp4" ]]; then
+    [[ -n "${SKIP[$vid]+x}" ]] && continue
+    is_fully_evaluated "$vid" && { log "  [skip] $vid — already evaluated."; continue; }
+    if [[ -f "$VIDEO_DIR/$vid.mp4" ]]; then
         ALREADY_HAVE+=("$vid")
     else
         NEED_DOWNLOAD+=("$vid")
     fi
 done
 
-log "Already downloaded (process first): ${#ALREADY_HAVE[@]}"
-log "Need download: ${#NEED_DOWNLOAD[@]}"
+log "Already on disk: ${#ALREADY_HAVE[@]}  |  Need download: ${#NEED_DOWNLOAD[@]}"
 
-# ─── Phase 1: Already-downloaded videos ───────────────────────────────────────
-# Run SigLIP phase for all in parallel, then LLM+eval sequentially.
-if [[ ${#ALREADY_HAVE[@]} -gt 0 ]]; then
-    log "--- SigLIP phase for ${#ALREADY_HAVE[@]} already-downloaded videos (parallel) ---"
-    for vid in "${ALREADY_HAVE[@]}"; do
-        build_siglip_phase "$vid" &
-    done
-    wait
-    log "--- SigLIP phase complete ---"
-    wait_gpu_free
-fi
-
+# ─── Phase 1: Videos already on disk ──────────────────────────────────────────
 for vid in "${ALREADY_HAVE[@]}"; do
+    wait_gpu_free
     process_video "$vid"
+    cleanup_video "$vid"
 done
 
 # ─── Phase 2: Batch download → process → delete ───────────────────────────────
@@ -238,48 +162,36 @@ N="${#NEED_DOWNLOAD[@]}"
 i=0
 
 while (( i < N )); do
-    # Disk guard: cap effective batch size by available space (~2 GB per video)
+    # Cap batch by available disk (~3 GB per video)
     disk_now=$(free_gb)
     max_by_disk=$(( disk_now / 3 ))
     (( max_by_disk < 1 )) && max_by_disk=1
     effective=$(( BATCH_SIZE < max_by_disk ? BATCH_SIZE : max_by_disk ))
 
-    # Slice next batch
     batch=()
     for (( j=i; j<N && j<i+effective; j++ )); do
         batch+=("${NEED_DOWNLOAD[$j]}")
     done
     i=$(( i + ${#batch[@]} ))
 
-    log "─── Batch $((i / effective)) / $(( (N + effective - 1) / effective )) — downloading ${#batch[@]} videos in parallel ───"
-
-    # Download all in parallel
-    for vid in "${batch[@]}"; do
-        download_video "$vid" &
-    done
+    log "─── Batch: downloading ${#batch[@]} videos in parallel ───"
+    for vid in "${batch[@]}"; do download_video "$vid" & done
     wait
-    log "  Batch downloads complete."
+    log "  Downloads complete."
 
-    # SigLIP phase for all downloaded videos in parallel
-    log "  Running SigLIP phase in parallel for downloaded videos..."
+    # Process + delete each video sequentially (single GPU)
     for vid in "${batch[@]}"; do
-        [[ -f "$VIDEOS/$vid.mp4" ]] && build_siglip_phase "$vid" &
-    done
-    wait
-    log "  SigLIP phase complete."
-    wait_gpu_free
-
-    # LLM phase + eval + cleanup — sequential (single GPU)
-    for vid in "${batch[@]}"; do
-        if [[ ! -f "$VIDEOS/$vid.mp4" ]]; then
-            log "  [ERROR] $vid.mp4 missing after download. Skipping."
+        if [[ ! -f "$VIDEO_DIR/$vid.mp4" ]]; then
+            log "  [ERROR] $vid.mp4 missing after download — skipping."
             continue
         fi
+        wait_gpu_free
         process_video "$vid"
+        cleanup_video "$vid"
     done
 done
 
-# ─── Final summary ────────────────────────────────────────────────────────────
+# ─── Summary ──────────────────────────────────────────────────────────────────
 log "=== run_rolling.sh complete ==="
 log "Free disk: $(free_gb) GB"
 print_accuracy

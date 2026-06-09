@@ -6,12 +6,13 @@ import json
 import os
 import pickle
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 from .causal import build_causal_request, parse_causal_edges
 from .character import (
     CharacterMention, DescriptionBasedCharacterResolver, LLMEntityResolver,
+    ObjectIdentityResolver,
 )
 from .episode import segment_episodes
 from .extraction import SceneData, run_scene_extraction
@@ -59,19 +60,27 @@ class VKGBuilder:
         self.config = config
 
     # ------------------------------------------------------------------
-    # Background transcription: called in a thread, overlaps with Step 1
+    # Background transcription: runs in a separate process, overlaps with Step 1
     # ------------------------------------------------------------------
 
     def _transcribe_background(self, video_path: str) -> Optional[List]:
-        """Run Whisper transcription in a background thread.
-        
-        Returns list of segments or raises on failure.
+        """Launch Whisper in an isolated worker process.
+
+        Running in a separate process (not just a thread) means Whisper's
+        model weights and CUDA allocations are fully released when the process
+        exits, and GIL contention with the SigLIP step is eliminated.
         """
+        import torch.multiprocessing as tmp
+        from .sampler import _whisper_transcribe_worker
+
+        whisper_model_size = getattr(self.whisper, "_model_size", "large-v3")
         try:
-            segments, _ = self.whisper.transcribe(
-                video_path, word_timestamps=False
-            )
-            return list(segments)
+            ctx = tmp.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+                future = executor.submit(
+                    _whisper_transcribe_worker, video_path, whisper_model_size
+                )
+                return future.result()
         except Exception as e:
             raise RuntimeError(f"Whisper transcription failed: {e}")
 
@@ -112,6 +121,8 @@ class VKGBuilder:
                     budget=self.config.get("frame_budget", 500),
                     hard_thresh=self.config.get("hard_boundary_thresh", 0.75),
                     soft_thresh=self.config.get("soft_boundary_thresh", 0.5),
+                    n_workers=self.config.get("n_chunk_workers", 8),
+                    coarse_fps=self.config.get("coarse_fps", 1.0),
                 )
 
                 question_time_refs = self.config.get("question_time_refs", [])
@@ -147,7 +158,7 @@ class VKGBuilder:
                         segments = whisper_future.result()
                     elif self.whisper is not None:
                         segments, _ = self.whisper.transcribe(
-                            video_path, word_timestamps=False
+                            video_path, word_timestamps=True
                         )
                         segments = list(segments)
                     else:
@@ -335,6 +346,53 @@ class VKGBuilder:
             else:
                 print("  Character resolution failed — keeping raw character mentions")
 
+            # Step 8.1: Object identity resolution
+            print("Step 8.1: Object identity resolution...")
+            obj_nodes = graph.get_nodes_by_type("ObjectNode")
+            obj_resolver = ObjectIdentityResolver()
+            obj_clusters = obj_resolver.resolve(obj_nodes, self.siglip)
+            if obj_clusters:
+                n_obj_edges = 0
+                for cluster_idx, cluster in enumerate(obj_clusters):
+                    entity_id = f"entity_obj_{cluster_idx}"
+                    for node in cluster:
+                        node.entity_id = entity_id
+                    for i, a in enumerate(cluster):
+                        for b in cluster[i + 1:]:
+                            graph.add_edge(VKGEdge(
+                                source_id=a.id, target_id=b.id,
+                                relation_type="SAME_ENTITY", weight=1.0, confidence=0.85,
+                                metadata={"source": "object_identity_resolver"},
+                            ))
+                            n_obj_edges += 1
+                print(f"  Resolved {len(obj_clusters)} object identity groups, "
+                      f"{n_obj_edges} SAME_ENTITY edges")
+            else:
+                print("  Object identity resolution skipped or no cross-scene objects found")
+
+            # Step 8.2: Location nodes + TAKES_PLACE_IN edges
+            print("Step 8.2: Location nodes...")
+            self._build_location_nodes(graph, scene_data)
+
+            # Step 8.3: Emotional arc edges (EMOTION_SHIFT)
+            print("Step 8.3: Emotional arc edges...")
+            n_emotion = self._build_emotion_shift_edges(graph)
+            print(f"  Added {n_emotion} EMOTION_SHIFT edges")
+
+            # Step 8.4: MENTIONS edges (speech → entity)
+            print("Step 8.4: MENTIONS edges...")
+            n_mentions = self._build_mentions_edges(graph, scene_data)
+            print(f"  Added {n_mentions} MENTIONS edges")
+
+            # Step 8.5: AudioEventNodes from RMS peaks
+            if sample.audio_rms is not None:
+                print("Step 8.5: Audio event nodes...")
+                n_audio = self._build_audio_event_nodes(graph, sample.audio_rms)
+                print(f"  Added {n_audio} AudioEventNodes")
+
+            # Step 8.6: EpisodeNode participant lists
+            self._build_episode_participant_lists(graph)
+
             graph.save(checkpoint_graph)
             _write_checkpoint(output_dir, "step8_graph_built")
             print(f"  Graph checkpoint saved ({len(graph.nodes)} nodes)")
@@ -391,6 +449,16 @@ class VKGBuilder:
                     print(f"  Step 10 skipped ({type(e).__name__}: {e})")
             graph.save(checkpoint_graph)
             _write_checkpoint(output_dir, "step10_causal")
+
+        # Step 10.5: NARRATIVE_ARC edges between consecutive episodes
+        episodes_sorted = graph.get_episodes()
+        for i in range(len(episodes_sorted) - 1):
+            graph.add_edge(VKGEdge(
+                source_id=episodes_sorted[i].id,
+                target_id=episodes_sorted[i + 1].id,
+                relation_type="NARRATIVE_ARC",
+                weight=1.0, confidence=1.0,
+            ))
 
         # Step 11: Semantic edges
         if _is_checkpoint(output_dir, "step11_semantic"):
@@ -519,21 +587,23 @@ class VKGBuilder:
             )
             graph.add_node(ep_node)
 
-        # Scene nodes
-        for scene in sample.scenes:
-            sd = scene_data.get(scene.id, SceneData(scene.id, (scene.t_start, scene.t_end)))
+        # Scene nodes — one per extraction window (preserves temporal attribution).
+        # scene_data keys are window IDs like "scene_0007_w03"; each has its own
+        # precise time_range so the activator can find exactly the right window
+        # for a given question time reference.
+        for win_id, sd in sorted(scene_data.items(), key=lambda x: x[1].time_range[0]):
             scene_node = VKGNode(
-                id=scene.id,
+                id=win_id,
                 node_type="SceneNode",
-                label=sd.scene_label or f"scene_{scene.id}",
+                label=sd.scene_label or win_id,
                 level=1,
-                t_start=scene.t_start,
-                t_end=scene.t_end,
-                keyframe_id=scene.keyframes[0].id if scene.keyframes else None,
+                t_start=sd.time_range[0],
+                t_end=sd.time_range[1],
                 metadata={
                     "mood":               sd.scene_mood,
                     "narrative_function": sd.narrative_function,
                     "current_speaker":    sd.current_speaker,
+                    "parent_scene_id":    sd.parent_scene_id,
                 },
             )
             graph.add_node(scene_node)
@@ -674,33 +744,42 @@ class VKGBuilder:
     # ------------------------------------------------------------------
 
     def _build_temporal_edges(self, graph: VKGraph) -> None:
+        # Level-0: fine-grained clip/event/speech ordering
         events = sorted(
             [n for n in graph.nodes.values() if n.level == 0],
             key=lambda n: n.t_start,
         )
         for i in range(len(events) - 1):
             a, b = events[i], events[i + 1]
-            if a.t_end <= b.t_start:
-                rel = "PRECEDES"
-            else:
-                rel = "OVERLAPS"
+            rel = "PRECEDES" if a.t_end <= b.t_start else "OVERLAPS"
             graph.add_edge(VKGEdge(
                 source_id=a.id, target_id=b.id,
                 relation_type=rel, weight=1.0, confidence=1.0,
             ))
 
+        # Level-1: scene-to-scene ordering (enables efficient coarse traversal)
+        scenes = sorted(
+            graph.get_nodes_by_type("SceneNode"), key=lambda n: n.t_start
+        )
+        for i in range(len(scenes) - 1):
+            graph.add_edge(VKGEdge(
+                source_id=scenes[i].id, target_id=scenes[i + 1].id,
+                relation_type="PRECEDES", weight=1.0, confidence=1.0,
+            ))
+
     def _build_hierarchical_edges(self, graph: VKGraph, sample) -> None:
-        # Scene → episode
+        # Scene window → episode: link by time-range overlap, not by scene.id
+        # (window SceneNodes have IDs like "scene_0007_w03", not scene.id)
         for ep in sample.episodes:
             ep_node = graph.nodes.get(ep.id)
             if ep_node is None:
                 continue
-            for scene in ep.scenes:
-                sc_node = graph.nodes.get(scene.id)
-                if sc_node:
+            for sc_node in graph.get_nodes_by_type("SceneNode"):
+                mid = (sc_node.t_start + sc_node.t_end) / 2
+                if ep_node.t_start <= mid <= ep_node.t_end:
                     sc_node.parent_id = ep.id
                     graph.add_edge(VKGEdge(
-                        source_id=ep.id, target_id=scene.id,
+                        source_id=ep.id, target_id=sc_node.id,
                         relation_type="CONTAINS", weight=1.0, confidence=1.0,
                     ))
 
@@ -1110,6 +1189,216 @@ class VKGBuilder:
                     relation_type="SPOKEN_BY", weight=confidence, confidence=confidence,
                     metadata={"source": "temporal_heuristic"},
                 ))
+
+
+    # ------------------------------------------------------------------
+    # New helper methods (Steps 8.2–8.6)
+    # ------------------------------------------------------------------
+
+    def _build_location_nodes(
+        self, graph: VKGraph, scene_data: Dict[str, SceneData]
+    ) -> None:
+        """Create LocationNodes and TAKES_PLACE_IN edges from scene extraction output."""
+        location_map: Dict[str, VKGNode] = {}
+
+        def _norm(loc: str) -> str:
+            return loc.lower().strip().rstrip("s")  # simple normalisation
+
+        for scene_id, sd in scene_data.items():
+            raw_loc = (sd.location or "").strip()
+            if not raw_loc or raw_loc.lower() == "unknown":
+                continue
+            key = _norm(raw_loc)
+            if key not in location_map:
+                loc_node = VKGNode(
+                    id=f"loc_{len(location_map):04d}",
+                    node_type="LocationNode",
+                    label=raw_loc,
+                    level=1,
+                    t_start=sd.time_range[0],
+                    t_end=sd.time_range[1],
+                )
+                graph.add_node(loc_node)
+                location_map[key] = loc_node
+            else:
+                # Extend the location node's time span
+                loc_node = location_map[key]
+                loc_node.t_start = min(loc_node.t_start, sd.time_range[0])
+                loc_node.t_end   = max(loc_node.t_end,   sd.time_range[1])
+
+            scene_node = graph.nodes.get(scene_id)
+            if scene_node:
+                scene_node.metadata["location"] = raw_loc
+                graph.add_edge(VKGEdge(
+                    source_id=scene_id,
+                    target_id=location_map[key].id,
+                    relation_type="TAKES_PLACE_IN",
+                    weight=1.0, confidence=1.0,
+                    metadata={"source": "scene_extraction"},
+                ))
+
+        if location_map:
+            print(f"  Created {len(location_map)} LocationNodes")
+
+    def _build_emotion_shift_edges(self, graph: VKGraph) -> int:
+        """Add EMOTION_SHIFT edges between consecutive character appearances with changing emotion."""
+        n_edges = 0
+        for char_node in graph.get_nodes_by_type("CharacterNode"):
+            appearances = sorted(
+                char_node.metadata.get("appearances", []),
+                key=lambda a: a.get("timestamp", 0),
+            )
+            prev_emotion = None
+            prev_app_node = char_node  # attach edge to the character node itself
+            for app in appearances:
+                emotion = (app.get("emotion") or "").strip().lower()
+                if not emotion or emotion == "unknown":
+                    continue
+                if prev_emotion and emotion != prev_emotion:
+                    graph.add_edge(VKGEdge(
+                        source_id=prev_app_node.id,
+                        target_id=char_node.id,
+                        relation_type="EMOTION_SHIFT",
+                        weight=0.9, confidence=0.9,
+                        metadata={
+                            "from": prev_emotion,
+                            "to":   emotion,
+                            "t":    app.get("timestamp", 0),
+                        },
+                    ))
+                    n_edges += 1
+                prev_emotion = emotion
+        return n_edges
+
+    def _build_mentions_edges(
+        self, graph: VKGraph, scene_data: Dict[str, SceneData]
+    ) -> int:
+        """Build MENTIONS edges: SpeechNode → entity, using VLM-extracted mentioned_entities.
+
+        Falls back to token-overlap heuristic when mentioned_entities is empty.
+        """
+        n_edges = 0
+        speech_nodes = graph.get_nodes_by_type("SpeechNode")
+        char_nodes   = graph.get_nodes_by_type("CharacterNode")
+        obj_nodes    = graph.get_nodes_by_type("ObjectNode")
+        entity_nodes = char_nodes + obj_nodes
+
+        # Index entities by label tokens for fast lookup
+        entity_label_idx: Dict[str, List[VKGNode]] = {}
+        for en in entity_nodes:
+            for tok in en.label.lower().split():
+                if len(tok) > 3:
+                    entity_label_idx.setdefault(tok, []).append(en)
+
+        # Pass 1: use VLM-extracted mentioned_entities (high confidence)
+        for scene_id, sd in scene_data.items():
+            for me in sd.mentioned_entities:
+                refers_to = me.get("refers_to_label", "").strip().lower()
+                if not refers_to:
+                    continue
+                target = graph.find_entity_in_scene(refers_to, scene_id)
+                if not target:
+                    # Broader search using find_event_by_description
+                    candidates = [n for n in entity_nodes
+                                  if sd.time_range[0] <= n.t_start <= sd.time_range[1]]
+                    target = graph.find_event_by_description(refers_to, candidates)
+                if not target:
+                    continue
+                # Find the SpeechNode covering this scene
+                for speech in speech_nodes:
+                    if sd.time_range[0] <= speech.t_start <= sd.time_range[1]:
+                        graph.add_edge(VKGEdge(
+                            source_id=speech.id, target_id=target.id,
+                            relation_type="MENTIONS", weight=0.9, confidence=0.9,
+                            metadata={"source": "llm_extraction",
+                                      "text":   me.get("text", "")},
+                        ))
+                        n_edges += 1
+
+        # Pass 2: token-overlap heuristic for SpeechNodes (subtitle source gets boost)
+        existing_mentions: set = set()
+        for elist in graph.edges.values():
+            for e in elist:
+                if e.relation_type == "MENTIONS":
+                    existing_mentions.add((e.source_id, e.target_id))
+
+        for speech in speech_nodes:
+            text_lower = speech.label.lower()
+            text_tokens = {w for w in text_lower.split() if len(w) > 3}
+            conf = 0.9 if speech.metadata.get("source") == "subtitle" else 0.75
+            for tok in text_tokens:
+                for en in entity_label_idx.get(tok, []):
+                    key = (speech.id, en.id)
+                    if key not in existing_mentions:
+                        # Verify the entity is temporally plausible (within 120s)
+                        if abs(en.t_start - speech.t_start) <= 120.0:
+                            graph.add_edge(VKGEdge(
+                                source_id=speech.id, target_id=en.id,
+                                relation_type="MENTIONS", weight=conf, confidence=conf,
+                                metadata={"source": "token_overlap"},
+                            ))
+                            existing_mentions.add(key)
+                            n_edges += 1
+        return n_edges
+
+    def _build_audio_event_nodes(
+        self, graph: VKGraph, audio_rms: "np.ndarray"
+    ) -> int:
+        """Create AudioEventNodes at RMS peaks ≥ mean + 2σ."""
+        import numpy as np
+        if audio_rms is None or len(audio_rms) == 0:
+            return 0
+        mean = float(np.mean(audio_rms))
+        std  = float(np.std(audio_rms))
+        threshold = mean + 2.0 * std
+        if threshold <= 0:
+            return 0
+
+        scene_nodes = sorted(graph.get_nodes_by_type("SceneNode"),
+                             key=lambda n: n.t_start)
+        n_created = 0
+        for sec, rms_val in enumerate(audio_rms):
+            if float(rms_val) < threshold:
+                continue
+            t = float(sec)
+            node = VKGNode(
+                id=f"audio_{sec:06d}",
+                node_type="AudioEventNode",
+                label=f"audio peak at {t:.0f}s",
+                level=0,
+                t_start=t,
+                t_end=t + 1.0,
+                confidence=min(1.0, float(rms_val) / max(threshold, 1e-6)),
+                metadata={"rms": float(rms_val), "threshold": threshold},
+            )
+            graph.add_node(node)
+
+            # Link to concurrent scene with ACCOMPANIES
+            for sc in scene_nodes:
+                if sc.t_start <= t <= sc.t_end:
+                    graph.add_edge(VKGEdge(
+                        source_id=node.id, target_id=sc.id,
+                        relation_type="ACCOMPANIES", weight=0.8, confidence=0.8,
+                    ))
+                    break
+            n_created += 1
+        return n_created
+
+    def _build_episode_participant_lists(self, graph: VKGraph) -> None:
+        """Annotate each EpisodeNode with character entity_ids who appear in it."""
+        for ep_node in graph.get_episodes():
+            participant_ids = []
+            seen: set = set()
+            for char in graph.get_nodes_by_type("CharacterNode"):
+                if char.entity_id and char.entity_id not in seen:
+                    # Character overlaps episode if any appearance falls within it
+                    for app in char.metadata.get("appearances", []):
+                        t = app.get("timestamp", 0)
+                        if ep_node.t_start <= t <= ep_node.t_end:
+                            participant_ids.append(char.entity_id)
+                            seen.add(char.entity_id)
+                            break
+            ep_node.metadata["participant_entity_ids"] = participant_ids
 
 
 # ------------------------------------------------------------------

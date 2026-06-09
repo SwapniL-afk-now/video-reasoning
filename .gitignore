@@ -41,6 +41,9 @@ LVBench_full.csv
 # Benchmarks / temp data
 benchmarks/sonnet.txt
 
+# Virtual environment
+.venv/
+
 # Environment / secrets
 .env
 .env.*

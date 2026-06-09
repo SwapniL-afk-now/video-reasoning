@@ -11,6 +11,69 @@ import numpy as np
 from .schema import VKGEdge, VKGraph
 
 
+def _node_text(node) -> str:
+    """Produce a rich text description of a node for SigLIP embedding."""
+    t = f"{node.t_start:.0f}s"
+    nt = node.node_type
+    if nt == "ObjectNode":
+        attrs = ", ".join(node.metadata.get("attributes", []))
+        state = node.metadata.get("state", "")
+        desc = node.label
+        if attrs:
+            desc += f" [{attrs}]"
+        if state:
+            desc += f" ({state})"
+        return f"object: {desc} at {t}"
+    if nt == "ActionNode":
+        actor = node.metadata.get("actor", "")
+        obj   = node.metadata.get("object", "")
+        desc  = node.label
+        if actor:
+            desc += f" by {actor}"
+        if obj:
+            desc += f" on {obj}"
+        return f"action: {desc} at {t}"
+    if nt == "CharacterNode":
+        canon = node.canonical_description or node.label
+        return f"character: {canon} at {t}"
+    if nt == "SpeechNode":
+        # Speech text is already the best description; prepend source for narrator
+        src = node.metadata.get("source", "")
+        prefix = "[NARRATOR] " if src == "narrator" else ""
+        return f"{prefix}{node.label}"
+    if nt == "StateChangeNode":
+        frm = node.prev_state or ""
+        to  = node.next_state or ""
+        return f"state change: {node.label} from '{frm}' to '{to}' at {t}"
+    if nt == "OCRNode":
+        sem = node.metadata.get("semantic_type", "")
+        return f"text on screen: '{node.label}' ({sem}) at {t}"
+    if nt == "LocationNode":
+        return f"location: {node.label} from {node.t_start:.0f}s to {node.t_end:.0f}s"
+    if nt == "SceneNode":
+        loc = node.metadata.get("location", "")
+        mood = node.metadata.get("mood", "")
+        desc = node.label
+        if loc and loc != "unknown":
+            desc += f" at {loc}"
+        if mood and mood != "neutral":
+            desc += f" ({mood})"
+        return f"scene: {desc} at {t}"
+    if nt == "EpisodeNode":
+        summary = node.metadata.get("summary", "")
+        role    = node.metadata.get("narrative_role", "")
+        desc = node.label
+        if summary:
+            desc += f" — {summary[:80]}"
+        if role:
+            desc += f" [{role}]"
+        return f"episode: {desc} at {t}"
+    if nt == "AudioEventNode":
+        return f"audio event: {node.label}"
+    # Default: keep type prefix for unknowns
+    return f"{nt}: {node.label} at {t}"
+
+
 def build_faiss_index(
     graph: VKGraph,
     siglip_encoder,
@@ -23,11 +86,8 @@ def build_faiss_index(
         index = faiss.IndexHNSWFlat(dim, 32)
         return index
 
-    # Encode all nodes as text
-    texts = [
-        f"{n.node_type}: {n.label} at {n.t_start:.0f}s"
-        for n in nodes
-    ]
+    # Encode all nodes using type-specific rich text descriptions
+    texts = [_node_text(n) for n in nodes]
     embeddings = siglip_encoder.encode_text(texts).astype(np.float32)
 
     # Fuse visual nodes with image embeddings

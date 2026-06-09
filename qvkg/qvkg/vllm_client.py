@@ -14,9 +14,10 @@ from vllm.sampling_params import StructuredOutputsParams
 
 SCENE_EXTRACTION_SCHEMA = {
     "type": "object",
-    "required": ["scene_label", "objects", "actions", "spatial_relations",
+    "required": ["scene_label", "location", "objects", "actions", "spatial_relations",
                  "characters", "ocr_text", "ocr_semantics", "state_changes",
-                 "scene_mood", "current_speaker", "speaker_on_screen", "narrative_function"],
+                 "scene_mood", "current_speaker", "speaker_on_screen",
+                 "narrative_function", "mentioned_entities"],
     "properties": {
         "reasoning": {
             "type": "string",
@@ -25,6 +26,10 @@ SCENE_EXTRACTION_SCHEMA = {
         "scene_label": {
             "type": "string",
             "description": "Descriptive 2-6 word label capturing the key activity, e.g. 'hosts eating ramen outside 711', 'chef grilling wagyu beef', 'aerial view of coastal town'"
+        },
+        "location": {
+            "type": "string",
+            "description": "The specific place or setting where this scene occurs, e.g. 'kitchen', 'Times Square', 'soccer stadium', 'living room', 'hospital corridor'. Use 'unknown' if the setting is unclear."
         },
         "objects": {
             "type": "array",
@@ -54,12 +59,16 @@ SCENE_EXTRACTION_SCHEMA = {
                 "type": "object",
                 "required": ["description", "actor"],
                 "properties": {
-                    "description": {"type": "string"},
-                    "actor":       {"type": "string",
-                                    "description": "character description or 'unknown'"},
-                    "object":      {"type": "string",
-                                    "description": "object being acted upon, if any"},
-                    "confidence":  {"type": "number"}
+                    "description":      {"type": "string"},
+                    "actor":            {"type": "string",
+                                         "description": "character description or 'unknown'"},
+                    "object":           {"type": "string",
+                                         "description": "object being acted upon, if any"},
+                    "confidence":       {"type": "number"},
+                    "approx_timestamp": {
+                        "type": "number",
+                        "description": "estimated seconds from video start when this action occurs, within the scene's time range"
+                    }
                 }
             }
         },
@@ -185,6 +194,24 @@ SCENE_EXTRACTION_SCHEMA = {
                             "e.g. 'salmon sashimi dish on left plate', 'game clock', "
                             "'chapter heading', 'player wearing jersey #23'"
                         )
+                    }
+                }
+            }
+        },
+        "mentioned_entities": {
+            "type": "array",
+            "description": "Entities explicitly named or referred to in dialogue/speech during this scene",
+            "items": {
+                "type": "object",
+                "required": ["text", "refers_to_label"],
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Exact wording used in speech, e.g. 'the red car', 'John', 'that knife'"
+                    },
+                    "refers_to_label": {
+                        "type": "string",
+                        "description": "Label of the visible entity this refers to, matching an entry in objects or characters"
                     }
                 }
             }
@@ -341,7 +368,15 @@ _SCENE_BASE_PROMPT = (
     "exposition, transition, reaction, commentary, highlight, or interview.\n\n"
     "OCR SEMANTICS: For each item in ocr_text, add a parallel entry in ocr_semantics "
     "describing what the text refers to (e.g., '¥980' refers to 'salmon dish price', "
-    "'23:47' refers to 'game clock', 'CHAPTER 3' refers to 'chapter heading')."
+    "'23:47' refers to 'game clock', 'CHAPTER 3' refers to 'chapter heading').\n\n"
+    "LOCATION: Set 'location' to the specific setting name (e.g. 'kitchen', "
+    "'hospital corridor', 'Times Square', 'soccer pitch'). Use 'unknown' only if truly "
+    "indeterminate. This helps link scenes that occur in the same place.\n\n"
+    "ACTION TIMESTAMPS: For each action, set 'approx_timestamp' to the estimated "
+    "video time in seconds when it occurs. Use the frame timestamps shown to estimate.\n\n"
+    "MENTIONED ENTITIES: In 'mentioned_entities', list every object or character that "
+    "is explicitly named or referred to in speech/dialogue during this scene, with the "
+    "matching label from the objects or characters array."
 )
 
 _TYPE_ADDENDA = {
@@ -702,14 +737,15 @@ def build_siglip_encoder(model_name: str = "google/siglip-so400m-patch14-384"):
     model = SiglipModel.from_pretrained(model_name, torch_dtype=torch.float16)
     model = model.to(device).eval()
     processor = AutoProcessor.from_pretrained(model_name)
-    return SigLIPEncoder(model, processor, device)
+    return SigLIPEncoder(model, processor, device, model_name=model_name)
 
 
 class SigLIPEncoder:
-    def __init__(self, model, processor, device: str):
+    def __init__(self, model, processor, device: str, model_name: str = ""):
         self.model = model
         self.processor = processor
         self.device = device
+        self.model_name = model_name
 
     @property
     def embedding_dim(self) -> int:

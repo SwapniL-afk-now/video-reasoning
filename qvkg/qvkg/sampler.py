@@ -2,6 +2,7 @@ from __future__ import annotations
 
 """Hierarchical frame sampler: 4-level importance-scored selection."""
 
+import io
 import os
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -15,6 +16,56 @@ from PIL import Image
 from .schema import Episode, FrameInfo, SampleResult, Scene
 
 
+# ---------------------------------------------------------------------------
+# Module-level SigLIP worker — must be at module scope for multiprocessing
+# ---------------------------------------------------------------------------
+
+def _siglip_chunk_worker(jpeg_bytes_list: list, model_name: str, device: str) -> np.ndarray:
+    """Worker process: load SigLIP, encode chunk, exit (GPU memory freed on exit)."""
+    import io
+    import numpy as np
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, SiglipModel
+
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = SiglipModel.from_pretrained(model_name, torch_dtype=torch.float16)
+    model = model.to(device).eval()
+
+    images = [Image.open(io.BytesIO(b)).convert("RGB") for b in jpeg_bytes_list]
+
+    all_embs: list = []
+    batch_size = 64  # smaller per-worker since GPU is shared across workers
+    for i in range(0, len(images), batch_size):
+        batch = images[i:i + batch_size]
+        inputs = processor(images=batch, return_tensors="pt").to(device)
+        with torch.no_grad():
+            output = model.get_image_features(**inputs)
+            features = output.pooler_output if hasattr(output, "pooler_output") else output[1]
+            features = features / features.norm(dim=-1, keepdim=True)
+            all_embs.append(features.cpu().float().numpy())
+
+    # Explicit cleanup before process exits
+    del model
+    torch.cuda.empty_cache()
+
+    return np.concatenate(all_embs, axis=0) if all_embs else np.zeros((0, 1152))
+
+
+# ---------------------------------------------------------------------------
+# Module-level Whisper worker
+# ---------------------------------------------------------------------------
+
+def _whisper_transcribe_worker(video_path: str, model_size: str) -> list:
+    """Worker process: load Whisper, transcribe, return segments, exit."""
+    from faster_whisper import WhisperModel
+    model = WhisperModel(model_size, device="cuda", compute_type="float16")
+    segments, _ = model.transcribe(video_path, word_timestamps=True)
+    result = list(segments)
+    del model
+    return result
+
+
 class HierarchicalSampler:
     def __init__(self, siglip_encoder=None, yolo_model=None):
         self.siglip = siglip_encoder
@@ -25,12 +76,15 @@ class HierarchicalSampler:
     # ------------------------------------------------------------------
 
     def sample(self, video_path: str, budget: int = 500,
-               hard_thresh: float = 0.75, soft_thresh: float = 0.5) -> SampleResult:
-        coarse, fps, audio_rms = self._extract_coarse_frames(video_path)
+               hard_thresh: float = 0.75, soft_thresh: float = 0.5,
+                n_workers: int = 8, coarse_fps: float = 1.0) -> SampleResult:
+        coarse, fps, audio_rms = self._extract_coarse_frames(
+            video_path, target_fps=coarse_fps, n_workers=n_workers,
+        )
         if not coarse:
             return SampleResult([], [], [])
 
-        print(f"  Extracted {len(coarse)} coarse frames at ~3fps")
+        print(f"  Extracted {len(coarse)} coarse frames at ~{coarse_fps}fps")
         siglip_embs = self._siglip_batch(coarse)
         scores = self._score_all(coarse, audio_rms, siglip_embs)
         boundaries = self._detect_boundaries(coarse, scores, hard_thresh, soft_thresh,
@@ -42,9 +96,10 @@ class HierarchicalSampler:
             sc_frames = coarse[scene._start_idx:scene._end_idx + 1]
             sc_scores = scores[scene._start_idx:scene._end_idx + 1]
             duration = scene.t_end - scene.t_start
-            k = max(2, int(duration / 15))
+            # 1 keyframe per 5s — dense enough to catch 2-3s chyrons/dialogue moments
+            k = max(2, int(duration / 5))
             kf = self._select_keyframes(sc_frames, sc_scores, k,
-                                        max_gap_sec=30.0)
+                                        max_gap_sec=10.0)
             scene.keyframes = kf
             keyframes.extend(kf)
 
@@ -53,6 +108,7 @@ class HierarchicalSampler:
         return SampleResult(
             keyframes=keyframes, scenes=boundaries, episodes=[],
             siglip_embeddings=siglip_embs,
+            audio_rms=audio_rms,
         )
 
     # ------------------------------------------------------------------
@@ -121,32 +177,92 @@ class HierarchicalSampler:
 
         return sorted(all_frames, key=lambda f: f.timestamp)
 
-    def _extract_coarse_frames(
-        self, video_path: str, target_fps: float = 3.0
-    ) -> Tuple[List[FrameInfo], float, np.ndarray]:
+    def _extract_chunk_frames(
+        self, video_path: str, t_start: float, t_end: float,
+        target_fps: float, chunk_idx: int,
+    ) -> List[FrameInfo]:
+        """Extract frames from [t_start, t_end] at target_fps. Thread-safe."""
         frames: List[FrameInfo] = []
         container = av.open(video_path)
         stream = container.streams.video[0]
-        fps = float(stream.average_rate or 25)
-        duration = float(stream.duration * stream.time_base) if stream.duration else 0
-
-        # Extract audio RMS per second
-        audio_rms = self._extract_audio_rms(video_path)
+        time_base = stream.time_base
 
         step_sec = 1.0 / target_fps
-        time_base = stream.time_base
-        target_ts = 0.0
-        while target_ts <= duration:
+        target_ts = t_start
+        frame_num = 0
+        while target_ts <= t_end:
             pts = int(target_ts / float(time_base))
             container.seek(pts, stream=stream)
             for av_frame in container.decode(video=0):
-                img = av_frame.to_image().convert("RGB")
-                fid = f"f_{len(frames):06d}"
-                frames.append(FrameInfo(id=fid, timestamp=target_ts, image=img))
+                # Retry reformat on EAGAIN (Errno 11) — can occur under heavy
+                # parallel load when libswscale's internal buffers are briefly
+                # unavailable.
+                for _attempt in range(5):
+                    try:
+                        img = av_frame.to_image().convert("RGB")
+                        break
+                    except BlockingIOError:
+                        import time as _time
+                        _time.sleep(0.05 * (2 ** _attempt))
+                else:
+                    img = av_frame.to_image().convert("RGB")  # final raise
+                frames.append(FrameInfo(
+                    id=f"f_c{chunk_idx}_{frame_num:05d}",
+                    timestamp=target_ts,
+                    image=img,
+                ))
+                frame_num += 1
                 break
             target_ts += step_sec
 
         container.close()
+        return frames
+
+    def _extract_coarse_frames(
+        self, video_path: str, target_fps: float = 3.0, n_workers: int = 8,
+    ) -> Tuple[List[FrameInfo], float, np.ndarray]:
+        # Probe duration and fps first (cheap, no frame decode)
+        container = av.open(video_path)
+        stream = container.streams.video[0]
+        fps = float(stream.average_rate or 25)
+        duration = float(stream.duration * stream.time_base) if stream.duration else 0
+        container.close()
+
+        audio_rms = self._extract_audio_rms(video_path)
+
+        import time as _time
+        if n_workers <= 1:
+            print(f"  [sampler] sequential extraction (n_workers=1)")
+            frames = self._extract_chunk_frames(video_path, 0.0, duration, target_fps, 0)
+        else:
+            chunk_dur = duration / n_workers
+            chunks = [
+                (i * chunk_dur, min((i + 1) * chunk_dur, duration), i)
+                for i in range(n_workers)
+            ]
+            print(f"  [sampler] parallel extraction: {n_workers} workers × "
+                  f"{chunk_dur:.0f}s chunks (video={duration:.0f}s)")
+            t0 = _time.time()
+            with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                futures = [
+                    pool.submit(self._extract_chunk_frames,
+                                video_path, t_s, t_e, target_fps, idx)
+                    for t_s, t_e, idx in chunks
+                ]
+                chunk_results = [f.result() for f in futures]
+            elapsed = _time.time() - t0
+            per_chunk = [len(r) for r in chunk_results]
+            print(f"  [sampler] workers done in {elapsed:.1f}s — "
+                  f"frames per chunk: {per_chunk} (total={sum(per_chunk)})")
+            frames = sorted(
+                [fr for chunk in chunk_results for fr in chunk],
+                key=lambda f: f.timestamp,
+            )
+
+        # Re-assign sequential IDs after merge
+        for i, f in enumerate(frames):
+            f.id = f"f_{i:06d}"
+
         return frames, fps, audio_rms
 
     def _extract_audio_rms(self, video_path: str) -> np.ndarray:
@@ -230,19 +346,75 @@ class HierarchicalSampler:
             chunk_scores[local_i] = self._score_frame(global_i, frames, embeddings, audio_rms)
         return idx_range, chunk_scores
 
-    def _siglip_batch(self, frames: List[FrameInfo]) -> Optional[np.ndarray]:
+    def _siglip_batch(self, frames: List[FrameInfo], n_workers: int = 8) -> Optional[np.ndarray]:
+        """Encode frames through N independent SigLIP worker processes.
+
+        Each worker loads its own SigLIP instance on the GPU, encodes its
+        chunk of frames, then exits — releasing its GPU allocation.
+        The main-process SigLIP is moved to CPU during this phase so workers
+        have maximum VRAM headroom.
+
+        Frame data is shared via JPEG bytes (~100 KB/frame) to avoid the
+        ~36 GB cost of serialising raw pixel arrays.
+        """
         if self.siglip is None:
             return None
+
+        import torch
+        import torch.multiprocessing as tmp
+        from concurrent.futures import ProcessPoolExecutor
+
         try:
             images = [f.image for f in frames]
-            batch_size = 32
-            all_embs = []
-            for i in range(0, len(images), batch_size):
-                batch = images[i:i + batch_size]
-                embs = self.siglip.encode_images_batch(batch)
-                all_embs.append(embs)
-            return np.concatenate(all_embs, axis=0)
+            n = len(images)
+            if n == 0:
+                return np.zeros((0, self.siglip.model.config.vision_config.hidden_size))
+
+            # -- Compress frames to JPEG bytes in parallel (CPU, fast) --
+            def _to_jpeg(img):
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=85)
+                return buf.getvalue()
+
+            with ThreadPoolExecutor(max_workers=min(16, n)) as pool:
+                jpeg_bytes = list(pool.map(_to_jpeg, images))
+
+            # -- Split into equal chunks for workers --
+            actual_workers = min(n_workers, n)
+            chunk_size = max(1, n // actual_workers)
+            chunks = [jpeg_bytes[i:i + chunk_size]
+                      for i in range(0, n, chunk_size)]
+
+            model_name = self.siglip.model_name
+            device     = self.siglip.device
+
+            # Move main SigLIP to CPU so workers have full VRAM
+            self.siglip.model.cpu()
+            torch.cuda.empty_cache()
+            print(f"  [siglip] spawning {len(chunks)} worker processes "
+                  f"({n} frames, ~{chunk_size} each)")
+
+            try:
+                with ProcessPoolExecutor(
+                    max_workers=len(chunks),
+                    mp_context=tmp.get_context("spawn"),
+                ) as executor:
+                    futures = [
+                        executor.submit(_siglip_chunk_worker, chunk, model_name, device)
+                        for chunk in chunks
+                    ]
+                    results = [f.result() for f in futures]
+
+                return np.concatenate(results, axis=0)
+
+            finally:
+                # Always restore main SigLIP to GPU
+                self.siglip.model.to(self.siglip.device)
+                torch.cuda.empty_cache()
+
         except Exception:
+            import traceback
+            traceback.print_exc()
             return None
 
     def _histogram_diff(self, a: np.ndarray, b: np.ndarray) -> float:
@@ -369,19 +541,20 @@ class HierarchicalSampler:
             return []
 
         selected: List[FrameInfo] = []
-        last_t = -9999.0
+        selected_times: List[float] = []
         sorted_idx = np.argsort(scores)[::-1]
 
         for idx in sorted_idx:
             if len(selected) >= k:
                 break
             t = frames[idx].timestamp
-            if t - last_t < min_gap_sec:
+            # abs() gap: don't skip frames earlier in time than the last pick
+            if selected_times and min(abs(t - st) for st in selected_times) < min_gap_sec:
                 continue
             selected.append(frames[idx])
-            last_t = t
+            selected_times.append(t)
 
-        # Coverage pass: fill gaps > max_gap_sec
+        # Coverage pass: fill gaps > max_gap_sec (including leading/trailing)
         selected = self._fill_coverage_gaps(frames, selected, max_gap_sec)
         return sorted(selected, key=lambda f: f.timestamp)
 
@@ -391,20 +564,44 @@ class HierarchicalSampler:
         selected: List[FrameInfo],
         max_gap_sec: float,
     ) -> List[FrameInfo]:
+        if not all_frames:
+            return selected
+
         sel = sorted(selected, key=lambda f: f.timestamp)
         extra: List[FrameInfo] = []
 
-        if not sel and all_frames:
+        if not sel:
             extra.append(all_frames[len(all_frames) // 2])
+            return extra
 
-        for i in range(len(sel) - 1):
-            gap = sel[i + 1].timestamp - sel[i].timestamp
-            if gap > max_gap_sec:
-                mid_t = (sel[i].timestamp + sel[i + 1].timestamp) / 2
-                best = min(all_frames, key=lambda f: abs(f.timestamp - mid_t))
-                extra.append(best)
+        # Build the boundary list: scene_start, all selected, scene_end
+        # then iteratively fill any gap > max_gap_sec until none remain.
+        boundary_start = all_frames[0].timestamp
+        boundary_end   = all_frames[-1].timestamp
+        frame_by_t = {f.timestamp: f for f in all_frames}
+        all_ts_sorted = sorted(frame_by_t)
 
-        return sel + extra
+        result = {f.timestamp: f for f in sel}
+
+        changed = True
+        while changed:
+            changed = False
+            sorted_ts = sorted(result)
+            # Check leading gap
+            checkpoints = (
+                [(boundary_start, sorted_ts[0])]
+                + [(sorted_ts[i], sorted_ts[i + 1]) for i in range(len(sorted_ts) - 1)]
+                + [(sorted_ts[-1], boundary_end)]
+            )
+            for lo, hi in checkpoints:
+                if hi - lo > max_gap_sec:
+                    mid_t = (lo + hi) / 2
+                    best_t = min(all_ts_sorted, key=lambda t: abs(t - mid_t))
+                    if best_t not in result:
+                        result[best_t] = frame_by_t[best_t]
+                        changed = True
+
+        return list(result.values())
 
     # ------------------------------------------------------------------
     # Budget rebalancing

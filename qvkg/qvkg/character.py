@@ -251,3 +251,100 @@ class DescriptionBasedCharacterResolver:
             char_nodes.append(node)
 
         return char_nodes
+
+
+class ObjectIdentityResolver:
+    """
+    DBSCAN-based object identity resolver.
+
+    Clusters ObjectNodes with similar label+attribute descriptions across scenes
+    so that the same physical object (e.g. 'red sports car') is linked with
+    SAME_ENTITY edges regardless of which scene it appears in.
+    Uses the same SigLIP text embedding + token-Jaccard merge strategy as
+    DescriptionBasedCharacterResolver.
+    """
+
+    def resolve(
+        self,
+        obj_nodes: List[VKGNode],
+        siglip_encoder,
+        similarity_threshold: float = 0.70,
+    ) -> Optional[List[List[VKGNode]]]:
+        """Return clusters of ObjectNodes that represent the same physical object.
+
+        Returns a list of clusters (each cluster is a list of VKGNode). Returns
+        None on failure. Singletons are excluded (need ≥2 occurrences).
+        """
+        from sklearn.cluster import DBSCAN
+
+        if not obj_nodes:
+            return None
+
+        def _obj_desc(n: VKGNode) -> str:
+            attrs = ", ".join(n.metadata.get("attributes", []))
+            state = n.metadata.get("state", "")
+            parts = [n.label]
+            if attrs:
+                parts.append(attrs)
+            if state:
+                parts.append(state)
+            return " ".join(parts)
+
+        descriptions = [_obj_desc(n) for n in obj_nodes]
+
+        try:
+            embeddings = siglip_encoder.encode_text(descriptions)
+        except Exception as e:
+            print(f"  Object identity resolution embedding failed: {e}")
+            return None
+
+        import faiss
+        import numpy as np
+        emb = np.array(embeddings, dtype=np.float32)
+        faiss.normalize_L2(emb)
+
+        labels = DBSCAN(
+            eps=1.0 - similarity_threshold,
+            min_samples=2,
+            metric="cosine",
+        ).fit_predict(emb)
+
+        clusters: dict = {}
+        for node, label in zip(obj_nodes, labels):
+            if label == -1:
+                continue
+            clusters.setdefault(label, []).append(node)
+
+        cluster_keys = list(clusters.keys())
+
+        def _token_jaccard(a: str, b: str) -> float:
+            wa = {w for w in a.lower().split() if len(w) > 3}
+            wb = {w for w in b.lower().split() if len(w) > 3}
+            if not wa or not wb:
+                return 0.0
+            return len(wa & wb) / len(wa | wb)
+
+        canonicals = {
+            k: max(clusters[k], key=lambda n: len(_obj_desc(n)))
+            for k in cluster_keys
+        }
+        parent = {k: k for k in cluster_keys}
+
+        def _find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        for i, ki in enumerate(cluster_keys):
+            for kj in cluster_keys[i + 1:]:
+                if _find(ki) != _find(kj):
+                    if _token_jaccard(_obj_desc(canonicals[ki]),
+                                      _obj_desc(canonicals[kj])) >= 0.40:
+                        parent[_find(kj)] = _find(ki)
+
+        merged: dict = {}
+        for k in cluster_keys:
+            merged.setdefault(_find(k), []).extend(clusters[k])
+
+        return [group for group in merged.values() if len(group) >= 2]

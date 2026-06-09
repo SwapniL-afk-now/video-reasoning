@@ -47,6 +47,13 @@ EDGE_TYPES: Dict[str, str] = {
     "MENTIONS":          "speech mentions a visible entity",
     "LABELS":            "OCR text labels a visible object",
     "ACCOMPANIES":       "audio event tied to visual action",
+    "SPOKEN_BY":         "speech segment attributed to a character",
+    # Emotional continuity
+    "EMOTION_SHIFT":     "character's emotional state changes between two appearances",
+    # Location
+    "TAKES_PLACE_IN":    "scene or event occurs at this location",
+    # Narrative structure
+    "NARRATIVE_ARC":     "sequential narrative connection between episodes",
 }
 
 CAUSAL_EDGE_TYPES: Set[str] = {"CAUSES", "ENABLES", "PREVENTS", "MOTIVATES"}
@@ -160,6 +167,7 @@ class SampleResult:
     scenes:            List[Scene]
     episodes:          List[Episode]
     siglip_embeddings: Optional[np.ndarray] = None
+    audio_rms:         Optional[np.ndarray] = None
 
 
 @dataclass

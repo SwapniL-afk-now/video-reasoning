@@ -21,9 +21,16 @@ def segment_episodes(
     if not scenes:
         return []
 
+    # scene_data keys are window IDs (e.g., "scene_0007_w00"); find the first
+    # window whose parent_scene_id matches each scene to get its label.
+    def _scene_label(s) -> str:
+        for sd in scene_data.values():
+            if sd.parent_scene_id == s.id:
+                return sd.scene_label or "unknown"
+        return "unknown"
+
     scene_descriptions = [
-        f"Scene {i} [{s.t_start:.0f}s-{s.t_end:.0f}s]: "
-        f"{scene_data.get(s.id, SceneData(s.id, (s.t_start, s.t_end))).scene_label or 'unknown'}"
+        f"Scene {i} [{s.t_start:.0f}s-{s.t_end:.0f}s]: {_scene_label(s)}"
         for i, s in enumerate(scenes)
     ]
 

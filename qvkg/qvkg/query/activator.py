@@ -48,10 +48,23 @@ class SubgraphActivator:
         activated: Set[str] = {n.id for n in seeds}
 
         # Step 2: Intent-driven graph expansion
+        # Episode-level TEMPORAL: detect if question spans >300s by checking seed spread
+        _seed_tspan = 0.0
+        if seeds:
+            _seed_tspan = max(n.t_end for n in seeds) - min(n.t_start for n in seeds)
+
         for intent in intents:
             if intent == "TEMPORAL":
-                for node in seeds:
-                    activated |= self._walk_temporal_spine(node, hops=4)
+                if _seed_tspan > 300.0:
+                    # Long-span question — traverse PRECEDES at EpisodeNode level
+                    for ep in self.graph.get_nodes_by_type("EpisodeNode"):
+                        if any(s.t_start <= ep.t_end and s.t_end >= ep.t_start
+                               for s in seeds):
+                            activated.add(ep.id)
+                            activated |= self._walk_temporal_spine(ep, hops=3)
+                else:
+                    for node in seeds:
+                        activated |= self._walk_temporal_spine(node, hops=4)
 
             elif intent == "CAUSAL":
                 for node in seeds:
@@ -103,6 +116,63 @@ class SubgraphActivator:
                     activated.add(ep.id)
                     for child in self.graph.get_children(ep, depth=1):
                         activated.add(child.id)
+
+            elif intent == "COUNTERFACT":
+                for node in seeds:
+                    activated |= self._follow_causal_edges(node, depth=2)
+                # Also pull in LocationNodes and concurrent scenes for counterfactual context
+                for nid in list(activated):
+                    node = self.graph.nodes.get(nid)
+                    if node and node.node_type in ("SceneNode", "EpisodeNode"):
+                        for edge in self.graph.get_edges(nid):
+                            if edge.relation_type == "TAKES_PLACE_IN":
+                                activated.add(edge.target_id)
+
+            elif intent == "EMOTIONAL":
+                for node in seeds:
+                    if node.node_type == "CharacterNode":
+                        activated |= self._follow_emotion_shift(node)
+                # If seed is not a CharacterNode, find nearby CharacterNodes
+                char_nodes = self.graph.get_nodes_by_type("CharacterNode")
+                for char in char_nodes:
+                    if any(char.t_start <= s.t_end and char.t_end >= s.t_start
+                           for s in seeds):
+                        activated.add(char.id)
+                        activated |= self._follow_emotion_shift(char)
+                # Include concurrent SceneNodes for context
+                for nid in list(activated):
+                    node = self.graph.nodes.get(nid)
+                    if node and node.node_type == "CharacterNode":
+                        for scene in self.graph.get_nodes_by_type("SceneNode"):
+                            if scene.t_start <= node.t_end and scene.t_end >= node.t_start:
+                                activated.add(scene.id)
+
+            elif intent == "INTENTIONAL":
+                for node in seeds:
+                    # Follow MOTIVATES edges (subtype of causal)
+                    activated |= self._follow_motivates_edges(node, depth=3)
+                    # Also pull in CharacterNode appearances around the event
+                    if node.node_type in ("ActionNode", "SceneNode", "ClipNode"):
+                        for char in self.graph.get_nodes_by_type("CharacterNode"):
+                            if char.t_start <= node.t_end and char.t_end >= node.t_start:
+                                activated.add(char.id)
+
+            elif intent == "PROSPECTIVE":
+                # Find the latest activated event, then expand temporal successors
+                all_seeds_sorted = sorted(seeds, key=lambda n: n.t_start, reverse=True)
+                for node in all_seeds_sorted[:5]:
+                    activated |= self._expand_temporal_successors(node, hops=3)
+                # Always include the next EpisodeNode after the last seed
+                if all_seeds_sorted:
+                    latest_t = all_seeds_sorted[0].t_end
+                    episodes = sorted(
+                        self.graph.get_nodes_by_type("EpisodeNode"),
+                        key=lambda e: e.t_start,
+                    )
+                    for ep in episodes:
+                        if ep.t_start >= latest_t:
+                            activated.add(ep.id)
+                            break
 
         # Step 3: Include parent context
         parents = set()
@@ -157,7 +227,18 @@ class SubgraphActivator:
                 for node in seeds:
                     activated |= self._follow_causal_edges(node, depth=3)
 
-            elif intent == "IDENTITY":
+            elif intent in ("IDENTITY", "SEMANTIC"):
+                # Entity queries: characters are episode-level entities — they persist
+                # across many windows.  Pull in ALL CharacterNodes from every episode
+                # that overlaps the query window so identity questions have full context
+                # regardless of which specific window the name was extracted from.
+                for ep in self.graph.get_nodes_by_type("EpisodeNode"):
+                    if ep.t_start <= t_end and ep.t_end >= t_start:
+                        for node in self.graph.nodes.values():
+                            if node.node_type == "CharacterNode":
+                                activated.add(node.id)
+                        break  # only need one pass; CharacterNodes are global
+
                 for node in seeds:
                     if node.entity_id:
                         activated |= set(
@@ -254,6 +335,66 @@ class SubgraphActivator:
         for edge in self.graph.get_incoming_edges(node.id):
             if edge.relation_type in spatial_types:
                 activated.add(edge.source_id)
+        return activated
+
+    def _follow_emotion_shift(self, node: VKGNode) -> Set[str]:
+        """BFS along EMOTION_SHIFT edges in both directions."""
+        activated: Set[str] = set()
+        visited: Set[str] = {node.id}
+        queue = [node]
+        while queue:
+            curr = queue.pop(0)
+            for edge in self.graph.get_edges(curr.id):
+                if edge.relation_type == "EMOTION_SHIFT":
+                    nb = self.graph.nodes.get(edge.target_id)
+                    if nb and nb.id not in visited:
+                        visited.add(nb.id)
+                        activated.add(nb.id)
+                        queue.append(nb)
+            for edge in self.graph.get_incoming_edges(curr.id):
+                if edge.relation_type == "EMOTION_SHIFT":
+                    nb = self.graph.nodes.get(edge.source_id)
+                    if nb and nb.id not in visited:
+                        visited.add(nb.id)
+                        activated.add(nb.id)
+                        queue.append(nb)
+        return activated
+
+    def _follow_motivates_edges(self, node: VKGNode, depth: int) -> Set[str]:
+        """BFS along MOTIVATES edges (and reverse) up to `depth`."""
+        activated: Set[str] = set()
+        queue = [(node, 0)]
+        visited: Set[str] = {node.id}
+        while queue:
+            curr, d = queue.pop(0)
+            if d >= depth:
+                continue
+            for edge in self.graph.get_edges(curr.id):
+                if edge.relation_type == "MOTIVATES":
+                    nb = self.graph.nodes.get(edge.target_id)
+                    if nb and nb.id not in visited:
+                        visited.add(nb.id)
+                        activated.add(nb.id)
+                        queue.append((nb, d + 1))
+            for edge in self.graph.get_incoming_edges(curr.id):
+                if edge.relation_type == "MOTIVATES":
+                    nb = self.graph.nodes.get(edge.source_id)
+                    if nb and nb.id not in visited:
+                        visited.add(nb.id)
+                        activated.add(nb.id)
+                        queue.append((nb, d + 1))
+        return activated
+
+    def _expand_temporal_successors(self, node: VKGNode, hops: int) -> Set[str]:
+        """Walk forward-only along PRECEDES edges for `hops` steps."""
+        activated: Set[str] = set()
+        curr = node
+        for _ in range(hops):
+            neighbor = self.graph.get_neighbor(curr, "PRECEDES")
+            if not neighbor:
+                break
+            activated.add(neighbor.id)
+            curr = neighbor
         return activated
 
     def _prune_to_budget(

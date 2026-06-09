@@ -51,7 +51,11 @@ def _build_prompt(
     Returns (messages_list, sampling_params, intents, keyframe_timestamps).
     No LLM call is made — caller batches these and fires one llm.chat().
     """
-    intents = classify_intent(question)
+    intents = classify_intent(
+        question,
+        siglip_encoder=siglip_encoder,
+        question_types=question_type,
+    )
     activator = SubgraphActivator(graph, faiss_index, siglip_encoder)
     motion_rank = video_type in MOTION_RANK_TYPES
 
@@ -75,11 +79,14 @@ def _build_prompt(
     b64_urls: List[str] = []
     keyframe_timestamps: List[float] = []
 
-    # For narrow windows (≤60s) always extract exact frames from the raw video —
-    # pre-sampled keyframes may be several seconds off, which kills point-in-time
-    # key information retrieval questions ("what is shown at 14:16?").
+    # Frame selection strategy:
+    #   ≤90s  → force_live: re-extract exact frames from the raw video so
+    #            point-in-time and short-span questions always see the right moment.
+    #   >90s  → use VKG stored keyframes, but sampled in temporal buckets so the
+    #            model gets a uniform "film strip" across the full span rather than
+    #            8 confidence-ranked frames that may all cluster at one moment.
     window_sec = (t_end - t_start) if (t_start is not None and t_end is not None) else None
-    force_live = (window_sec is not None and window_sec <= 60.0 and video_path)
+    force_live = (window_sec is not None and window_sec <= 90.0 and video_path)
 
     if t_start is not None and video_path and (min_precision > gap_threshold_sec or force_live):
         live_frames = extract_frames_for_window(
@@ -91,11 +98,34 @@ def _build_prompt(
         keyframe_timestamps = [f.timestamp for f in live_frames]
     else:
         visual_nodes = subgraph.get_visual_nodes()
-        visual_nodes.sort(
-            key=lambda n: (0 if (n.keyframe_id or "").startswith("qs_") else 1,
-                           -n.confidence)
-        )
-        for n in visual_nodes[:max_keyframes]:
+
+        if window_sec and window_sec > 90.0 and t_start is not None and len(visual_nodes) > max_keyframes:
+            # Wide span: divide the query window into max_keyframes evenly-spaced
+            # buckets and pick the highest-confidence frame from each bucket.
+            # This ensures the model sees the full temporal span, not just a
+            # confidence-clustered subset of it.
+            bucket_w = window_sec / max_keyframes
+            selected: List = []
+            for i in range(max_keyframes):
+                lo = t_start + i * bucket_w
+                hi = t_start + (i + 1) * bucket_w
+                bucket = [n for n in visual_nodes if lo <= n.t_start < hi and n.keyframe_id]
+                if bucket:
+                    selected.append(max(bucket, key=lambda n: n.confidence))
+            # Fill any empty buckets with qs_live nodes (pre-sampled question frames)
+            if len(selected) < max_keyframes:
+                qs = [n for n in visual_nodes
+                      if (n.keyframe_id or "").startswith("qs_") and n not in selected]
+                selected.extend(qs[:max_keyframes - len(selected)])
+            visual_nodes = selected
+        else:
+            visual_nodes.sort(
+                key=lambda n: (0 if (n.keyframe_id or "").startswith("qs_") else 1,
+                               -n.confidence)
+            )
+            visual_nodes = visual_nodes[:max_keyframes]
+
+        for n in visual_nodes:
             if n.keyframe_id:
                 fi = frame_store.load(n.keyframe_id)
                 if fi:
@@ -120,6 +150,7 @@ def _build_prompt(
         question_types=question_type,
         t_start=t_start,
         t_end=t_end,
+        visual_provided=bool(b64_urls),
     )
 
     content = []
