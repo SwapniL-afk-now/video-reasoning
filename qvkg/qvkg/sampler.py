@@ -60,6 +60,7 @@ def _whisper_transcribe_worker(
     video_path: str,
     model_size: str,
     compute_type: str = "int8_float16",
+    initial_prompt: Optional[str] = None,
 ) -> list:
     """Worker process: load Whisper, transcribe, return segments, exit.
 
@@ -78,6 +79,10 @@ def _whisper_transcribe_worker(
         vad_filter=True,
         beam_size=1,
         condition_on_previous_text=False,
+        # Proper-noun vocabulary hint (names from question metadata / OCR):
+        # Whisper hallucinates hardest on names, and graph entity linking
+        # depends on getting them right.
+        initial_prompt=initial_prompt,
     )
     result = list(segments)
     del model

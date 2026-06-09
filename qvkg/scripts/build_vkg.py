@@ -31,6 +31,31 @@ def load_question_time_refs(csv_path: str, video_filename: str):
     return time_refs
 
 
+_VOCAB_STOP = {
+    "What", "When", "Where", "Which", "While", "After", "Before", "During",
+    "Does", "Both", "None", "Their", "There", "They", "Then", "That", "This",
+    "Show", "Video", "Following", "Mentioned", "According",
+}
+
+
+def load_question_vocab(csv_path: str, video_filename: str) -> list:
+    """Harvest proper nouns from this video's questions/options.
+
+    Fed to Whisper as an ``initial_prompt`` vocabulary hint so spoken names
+    are transcribed faithfully (ASR garbles names hardest, and entity linking
+    depends on them).
+    """
+    import re as _re
+    names = set()
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            if row.get("video_path", "") == video_filename:
+                for w in _re.findall(r"\b[A-Z][a-z]{2,15}\b", row.get("question", "")):
+                    if w not in _VOCAB_STOP:
+                        names.add(w)
+    return sorted(names)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Build Video Knowledge Graph")
     parser.add_argument("--video",          required=True, help="Path to input video")
@@ -119,9 +144,14 @@ def main():
 
     # Question-aware pre-sampling
     question_time_refs = []
+    asr_vocab = []
     if args.questions_csv:
         question_time_refs = load_question_time_refs(args.questions_csv, video_filename)
         print(f"  Loaded {len(question_time_refs)} question time-references for dense pre-sampling")
+        asr_vocab = load_question_vocab(args.questions_csv, video_filename)
+        if asr_vocab:
+            print(f"  ASR vocabulary hint: {', '.join(asr_vocab[:20])}"
+                  + (" …" if len(asr_vocab) > 20 else ""))
 
     config = {
         "frame_budget":            args.budget,
@@ -131,6 +161,7 @@ def main():
         "hard_boundary_thresh":    args.hard_boundary,
         "soft_boundary_thresh":    args.soft_boundary,
         "question_time_refs":      question_time_refs,
+        "asr_vocab":               asr_vocab,
         "video_type":              args.video_type,
         "subtitle_path":           args.subtitles,
         "coarse_fps":              args.coarse_fps,

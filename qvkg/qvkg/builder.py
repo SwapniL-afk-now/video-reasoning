@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import pickle
+import re
 import uuid
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
@@ -79,9 +80,12 @@ class VKGBuilder:
         try:
             ctx = tmp.get_context("spawn")
             with ProcessPoolExecutor(max_workers=1, mp_context=ctx) as executor:
+                asr_vocab = self.config.get("asr_vocab") or []
+                initial_prompt = ("Names mentioned: " + ", ".join(asr_vocab) + ".") \
+                    if asr_vocab else None
                 future = executor.submit(
                     _whisper_transcribe_worker, video_path, whisper_model_size,
-                    whisper_compute_type,
+                    whisper_compute_type, initial_prompt,
                 )
                 return future.result()
         except Exception as e:
@@ -351,6 +355,9 @@ class VKGBuilder:
                       f"removed {len(raw_ids)} raw mentions")
             else:
                 print("  Character resolution failed — keeping raw character mentions")
+
+            # Step 8.0b: ground on-screen name banners into character identity.
+            self._link_ocr_names_to_characters(graph)
 
             # Step 8.1: Object identity resolution
             print("Step 8.1: Object identity resolution...")
@@ -910,6 +917,62 @@ class VKGBuilder:
                     emotion=char.get("emotion"),
                 ))
         return mentions
+
+
+    _NAME_BANNER_RE = re.compile(
+        r"^[A-Z][A-Za-z'\u2019\-]{1,15}(?: [A-Z][A-Za-z'\u2019\-]{1,15}){0,2}$")
+
+    def _link_ocr_names_to_characters(self, graph: VKGraph) -> None:
+        """Link on-screen name banners (lower-thirds) to the characters shown.
+
+        TV/show content names people via OCR text (e.g. "SERINAH") displayed
+        while the person is on screen, but the extractor mints the OCRNode and
+        CharacterNode independently — the graph knows the name appeared and
+        that a person appeared, never that they are the same identity. Add a
+        DESCRIBES edge OCR -> character for co-occurring pairs, and fold the
+        name into the character's label so every downstream serialization and
+        keyword match sees it.
+        """
+        chars = graph.get_nodes_by_type("CharacterNode")
+        ocrs = graph.get_nodes_by_type("OCRNode")
+        if not chars or not ocrs:
+            return
+        n_edges = n_named = 0
+        for o in ocrs:
+            text = (o.label or "").strip()
+            # Name-like banner: 1-3 capitalized/UPPERCASE alphabetic words.
+            if not text or not self._NAME_BANNER_RE.match(text.title()):
+                continue
+            if not any(c.isalpha() for c in text) or any(c.isdigit() for c in text):
+                continue
+            name = text.title()
+            nearby = [c for c in chars
+                      if c.t_start is not None and o.t_start is not None
+                      and abs(c.t_start - o.t_start) <= 4.0]
+            for c in nearby:
+                graph.add_edge(VKGEdge(
+                    source_id=o.id, target_id=c.id,
+                    relation_type="DESCRIBES",
+                    weight=1.0, confidence=0.7 if len(nearby) > 1 else 0.9,
+                    metadata={"source": "ocr_name_banner", "name": name},
+                ))
+                n_edges += 1
+            # Only rename when the banner unambiguously points at one person.
+            if len(nearby) == 1:
+                c = nearby[0]
+                label = c.label or ""
+                if name.lower() not in label.lower():
+                    c.label = f"{name} ({label})" if label else name
+                    n_named += 1
+                    # Propagate the name to same-entity appearances.
+                    if c.entity_id:
+                        for nid in graph.entity_idx.get(c.entity_id, []):
+                            n = graph.nodes.get(nid)
+                            if n is not None and n.node_type == "CharacterNode" \
+                               and name.lower() not in (n.label or "").lower():
+                                n.label = f"{name} ({n.label})" if n.label else name
+        print(f"  OCR name banners: {n_edges} DESCRIBES edges, "
+              f"{n_named} characters named")
 
     def _link_characters_to_events(
         self,
