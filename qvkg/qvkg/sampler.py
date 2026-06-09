@@ -264,6 +264,14 @@ class HierarchicalSampler:
                         _time.sleep(0.05 * (2 ** _attempt))
                 else:
                     img = av_frame.to_image().convert("RGB")  # final raise
+                # Cap resolution at the VLM's effective input size (~1M px ≈
+                # 1024 long side). Every consumer downscales anyway (SigLIP
+                # 384², gray/hist 256px, vLLM max_pixels) — keeping 1080p PIL
+                # images for every coarse frame only burns ~6 MB each of RAM.
+                if max(img.size) > 1024:
+                    w, h = img.size
+                    scale = 1024 / max(w, h)
+                    img = img.resize((int(w * scale), int(h * scale)))
                 frames.append(FrameInfo(
                     id=f"f_c{chunk_idx}_{frame_num:05d}",
                     timestamp=target_ts,

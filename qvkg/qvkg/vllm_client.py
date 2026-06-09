@@ -569,11 +569,13 @@ ENTITY_RESOLUTION_SAMPLING = SamplingParams(
     structured_outputs=StructuredOutputsParams(json=ENTITY_RESOLUTION_SCHEMA),
 )
 
+# GREEDY: scene extraction defines the graph's content; at temperature 0.7 every
+# rebuild produced a materially different graph (measured ±13 pts accuracy swing
+# on the JTa subset between two builds of the same video). Determinism makes
+# builds reproducible and ablations meaningful. presence_penalty guards loops.
 OFFLINE_SAMPLING = SamplingParams(
-    temperature=0.7,
-    top_p=0.8,
-    top_k=20,
-    min_p=0.0,
+    temperature=0.0,
+    top_p=1.0,
     presence_penalty=1.5,
     max_tokens=8192,
     structured_outputs=StructuredOutputsParams(json=SCENE_EXTRACTION_SCHEMA),
@@ -759,8 +761,9 @@ def extract_mcq_answer(text: str) -> str:
     if matches:
         return matches[-1]
 
-    # Last resort: return the raw text trimmed
-    return text.strip()[:20]
+    # No letter found (e.g. truncated thinking). Return empty so callers fall
+    # back to their previous answer instead of emitting prose as a "letter".
+    return ""
 
 # ---------------------------------------------------------------------------
 # LLM factory

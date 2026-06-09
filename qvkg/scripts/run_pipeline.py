@@ -96,6 +96,8 @@ def build_vkg(video_path: str, output_dir: str, args, siglip, llm, whisper_model
     question_time_refs = load_question_time_refs(args.csv, video_filename)
     if question_time_refs:
         print(f"  Question-aware pre-sampling: {len(question_time_refs)} windows")
+    from build_vkg import load_question_vocab
+    asr_vocab = load_question_vocab(args.csv, video_filename)
 
     config = {
         "frame_budget":          args.budget,
@@ -105,6 +107,7 @@ def build_vkg(video_path: str, output_dir: str, args, siglip, llm, whisper_model
         "hard_boundary_thresh":  args.hard_boundary,
         "soft_boundary_thresh":  args.soft_boundary,
         "question_time_refs":    question_time_refs,
+        "asr_vocab":             asr_vocab,
         "n_chunk_workers":       args.n_chunk_workers,
         "coarse_fps":            args.coarse_fps,
         "coarse_frame_cap":      args.coarse_frame_cap,
@@ -325,7 +328,23 @@ def eval_video(
 # Cleanup
 # ---------------------------------------------------------------------------
 
+
+def download_video(video_path: str, video_id: str) -> bool:
+    """Download one LVBench video with yt-dlp (720p mp4). True on success."""
+    import subprocess
+    cmd = ["yt-dlp", "-f", "bestvideo[height<=720]+bestaudio",
+           "--merge-output-format", "mp4", "-o", video_path,
+           f"https://www.youtube.com/watch?v={video_id}"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+        return r.returncode == 0 and os.path.exists(video_path)
+    except Exception as e:
+        print(f"  [download ERR] {e}")
+        return False
+
+
 def cleanup(video_path: str, vkg_dir: str, keep_results: bool = True) -> None:
+
     """Delete video file and VKG directory to free disk space."""
     if os.path.exists(video_path):
         os.remove(video_path)
@@ -425,6 +444,11 @@ def main():
     parser.add_argument("--max-turns", type=int, default=6)
 
     # Pipeline control
+    parser.add_argument("--wandb-project", default=None,
+                        help="If set, log per-video + cumulative accuracy to this W&B project")
+    parser.add_argument("--download",     action="store_true",
+                        help="Download missing videos with yt-dlp inside the loop "
+                             "(download -> build -> eval -> delete, one video on disk at a time)")
     parser.add_argument("--no-cleanup",   action="store_true",
                         help="Keep video and VKG files after eval (default: delete them)")
     parser.add_argument("--skip-build",   action="store_true",
@@ -485,10 +509,17 @@ def main():
             questions  = questions_by_video[video_filename]
 
             print(f"\n[{video_idx+1}/{len(videos)}] {video_filename}")
+            import time as _time
+            t_video_start = _time.time()
 
             # --- Build ---
             vkg_exists = os.path.exists(os.path.join(vkg_dir, "vkg.json"))
             if not args.skip_build and not vkg_exists:
+                if not os.path.exists(video_path) and args.download:
+                    print(f"  Downloading {video_id}...")
+                    if not download_video(video_path, video_id):
+                        print(f"  [SKIP] Download failed: {video_id}")
+                        continue
                 if not os.path.exists(video_path):
                     print(f"  [SKIP] Video not found: {video_path}")
                     continue
@@ -515,6 +546,24 @@ def main():
                     llm=llm,
                     siglip=siglip,
                 )
+
+            # --- W&B logging (non-fatal) ---
+            if args.wandb_project:
+                import subprocess, sys as _sys, time as _time
+                dur = _time.time() - t_video_start
+                try:
+                    subprocess.run(
+                        [_sys.executable,
+                         os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "log_to_wandb.py"),
+                         "--results", args.results,
+                         "--video", video_id,
+                         "--duration", str(round(dur, 1)),
+                         "--project", args.wandb_project,
+                         "--run-name", "walker-full"],
+                        timeout=180)
+                except Exception as e:
+                    print(f"  [WARN] wandb logging failed: {e}")
 
             # --- Cleanup ---
             if not args.no_cleanup:
