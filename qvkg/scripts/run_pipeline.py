@@ -332,15 +332,29 @@ def eval_video(
 def download_video(video_path: str, video_id: str) -> bool:
     """Download one LVBench video with yt-dlp (720p mp4). True on success."""
     import subprocess
+    import time
     cmd = ["yt-dlp", "-f", "bestvideo[height<=720]+bestaudio",
            "--merge-output-format", "mp4", "-o", video_path,
+           "--retries", "10", "--fragment-retries", "10",
+           "--sleep-requests", "1",
            f"https://www.youtube.com/watch?v={video_id}"]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
-        return r.returncode == 0 and os.path.exists(video_path)
-    except Exception as e:
-        print(f"  [download ERR] {e}")
-        return False
+    for attempt in range(3):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            if r.returncode == 0 and os.path.exists(video_path):
+                return True
+            err = (r.stderr or "")[-300:]
+            # Permanently dead videos: don't retry.
+            if any(k in err for k in ("Private video", "no longer available",
+                                      "not available", "has been terminated")):
+                print(f"  [download] video permanently unavailable: {err.strip()[:120]}")
+                return False
+            print(f"  [download] attempt {attempt+1} failed: {err.strip()[:120]}")
+        except Exception as e:
+            print(f"  [download ERR] {e}")
+        # Rate-limit backoff before next attempt.
+        time.sleep(60 * (attempt + 1))
+    return False
 
 
 def cleanup(video_path: str, vkg_dir: str, keep_results: bool = True) -> None:
@@ -512,6 +526,11 @@ def main():
             import time as _time
             t_video_start = _time.time()
 
+            # Skip fully-answered videos BEFORE paying for download/build.
+            if all(q["uid"] in answered_uids for q in questions):
+                print("  All questions already answered — skipping.")
+                continue
+
             # --- Build ---
             vkg_exists = os.path.exists(os.path.join(vkg_dir, "vkg.json"))
             if not args.skip_build and not vkg_exists:
@@ -557,7 +576,7 @@ def main():
                          os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                       "log_to_wandb.py"),
                          "--results", args.results,
-                         "--video", video_id,
+                         f"--video={video_id}",
                          "--duration", str(round(dur, 1)),
                          "--project", args.wandb_project,
                          "--run-name", "walker-full"],

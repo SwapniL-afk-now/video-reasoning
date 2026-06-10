@@ -480,21 +480,35 @@ class HierarchicalSampler:
             out: List[np.ndarray] = []
             print(f"  [siglip] single-pass encode: {n} frames "
                   f"in batches of {gpu_batch}")
-            with torch.inference_mode():
-                for i in range(0, n, gpu_batch):
-                    batch = images[i:i + gpu_batch]
-                    inputs = self.siglip.processor(
-                        images=batch, return_tensors="pt"
-                    ).to(device)
-                    if use_autocast:
-                        with torch.autocast("cuda", dtype=torch.float16):
-                            output = self.siglip.model.get_image_features(**inputs)
-                    else:
+            def _encode(batch):
+                inputs = self.siglip.processor(
+                    images=batch, return_tensors="pt"
+                ).to(device)
+                if use_autocast:
+                    with torch.autocast("cuda", dtype=torch.float16):
                         output = self.siglip.model.get_image_features(**inputs)
-                    feats = (output.pooler_output
-                             if hasattr(output, "pooler_output") else output[1])
-                    feats = feats / feats.norm(dim=-1, keepdim=True)
-                    out.append(feats.cpu().float().numpy())
+                else:
+                    output = self.siglip.model.get_image_features(**inputs)
+                feats = (output.pooler_output
+                         if hasattr(output, "pooler_output") else output[1])
+                feats = feats / feats.norm(dim=-1, keepdim=True)
+                return feats.cpu().float().numpy()
+
+            with torch.inference_mode():
+                i = 0
+                while i < n:
+                    batch = images[i:i + gpu_batch]
+                    try:
+                        out.append(_encode(batch))
+                        i += len(batch)
+                    except torch.cuda.OutOfMemoryError:
+                        # vLLM may hold most of the GPU — halve and retry
+                        # rather than dropping embeddings for the whole video.
+                        torch.cuda.empty_cache()
+                        if gpu_batch <= 16:
+                            raise
+                        gpu_batch //= 2
+                        print(f"  [siglip] OOM — retrying with batch {gpu_batch}")
             return np.concatenate(out, axis=0) if out else np.zeros((0, dim))
 
         except Exception:

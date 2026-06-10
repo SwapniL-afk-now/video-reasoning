@@ -527,7 +527,22 @@ def _execute_build(state: WalkState, graph: VKGraph, faiss_index,
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
+
+# Hard cap on serialized-context characters per prompt. The model max is 65,536
+# tokens including image tokens (~10k for 8 frames); 140k chars ≈ ~35k text
+# tokens leaves comfortable headroom. Without this cap, large subgraphs
+# serialized past the model limit and every question in the batch ERRORed.
+MAX_CTX_CHARS = 140_000
+
+
+def _cap_ctx(ctx: str) -> str:
+    if len(ctx) <= MAX_CTX_CHARS:
+        return ctx
+    return ctx[:MAX_CTX_CHARS] + "\n...[context truncated]"
+
+
 def _subgraph_of(graph: VKGraph, node_ids: Set[str]):
+
     return graph_ops.build_subgraph(graph, node_ids)
 
 
@@ -581,7 +596,7 @@ def _controller_messages(state: WalkState, graph: VKGraph,
 
     # 3) Navigation context (same as before, as text).
     content.append({"type": "text", "text":
-        f"{ctx}\n\n"
+        f"{_cap_ctx(ctx)}\n\n"
         f"## Frontier node ids\n{frontier_preview}\n\n"
         f"## Missing evidence (gaps)\n{gap_text}\n\n"
         f"## Coverage so far\n{coverage:.2f}\n\n"
@@ -630,7 +645,7 @@ def _answerer_messages(state: WalkState, graph: VKGraph, node_ids: Set[str],
         content.append({"type": "text", "text": f"[t={ts:.0f}s]"})
 
     # 3) Serialized sub-graph context.
-    content.append({"type": "text", "text": ctx})
+    content.append({"type": "text", "text": _cap_ctx(ctx)})
     return [
         {"role": "system", "content": WALKER_ANSWER_SYSTEM},
         {"role": "user", "content": content},
@@ -814,8 +829,11 @@ def batch_walk_answer_questions(
         )
         for s, o in zip(pending, full_out):
             s.prev_answer = s.current_answer
-            s.current_answer = extract_mcq_answer(o.outputs[0].text) if mcq \
+            ans = extract_mcq_answer(o.outputs[0].text) if mcq \
                 else o.outputs[0].text.strip()
+            # Empty = truncated/parse failure: keep the previous answer rather
+            # than letting "" flow into the warrant as a real prediction.
+            s.current_answer = ans or s.current_answer
 
         # Ablated probe — only for states whose last action added a ring.
         # States whose action added NO ring get no free pass: their elasticity
@@ -834,8 +852,9 @@ def batch_walk_answer_questions(
                 use_tqdm=False,
             )
             for s, o in zip(ablate, ab_out):
-                ablated_answers[s.qid] = extract_mcq_answer(o.outputs[0].text) if mcq \
+                ab = extract_mcq_answer(o.outputs[0].text) if mcq \
                     else o.outputs[0].text.strip()
+                ablated_answers[s.qid] = ab or None
 
         # ---- 3b) Archive old frames, store answerer analysis as text. ----
         # Frames beyond the per-prompt image limit are converted to VKG-text
@@ -876,7 +895,7 @@ def batch_walk_answer_questions(
     # satisfied warrant). States that converged — warrant-satisfied or
     # citation-verified — keep the answer the walk certified; re-answering them
     # here was overwriting converged-correct letters.
-    final_states = [s for s in states if s.final_answer is None]
+    final_states = [s for s in states if not s.final_answer]
     if final_states:
         fin_msgs = [_answerer_messages(s, graph, s.node_ids) for s in final_states]
         fin_out = llm.chat(
