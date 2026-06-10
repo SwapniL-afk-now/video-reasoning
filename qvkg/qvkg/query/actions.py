@@ -166,7 +166,7 @@ def execute_action(
     state.stuck = False
 
     if name == "EXPAND":
-        relation = action.get("relation") or "CAUSAL"
+        relation = action.get("relation") or "causal"
         new_ids, _edges = graph_ops.expand(graph, state.frontier or state.node_ids,
                                             relation, k=k)
         ring = state.absorb(new_ids)

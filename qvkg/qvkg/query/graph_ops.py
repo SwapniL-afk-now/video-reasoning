@@ -22,13 +22,13 @@ from ..schema import CAUSAL_EDGE_TYPES, SubGraph, VKGEdge, VKGNode, VKGraph
 # The walker exposes a small, stable set of relation families. Each maps to one
 # or more concrete edge types from the schema taxonomy.
 RELATION_EDGE_TYPES: Dict[str, Set[str]] = {
-    "CAUSAL":   set(CAUSAL_EDGE_TYPES),                 # CAUSES/ENABLES/PREVENTS/MOTIVATES
-    "ENTITY":   {"SAME_ENTITY"},                        # + entity_idx threading (special-cased)
-    "SPEAKER":  {"SPOKEN_BY"},
-    "TEMPORAL": {"PRECEDES", "OVERLAPS", "DURING"},     # temporal backbone adjacency
-    "EMOTION":  {"EMOTION_SHIFT"},
-    "SIMILAR":  {"SIMILAR_TO", "DESCRIBES"},
-    "CONTAINS": {"CONTAINS"},
+    "causal":   set(CAUSAL_EDGE_TYPES),                 # CAUSES/ENABLES/PREVENTS/MOTIVATES
+    "entity":   {"SAME_ENTITY"},                        # + entity_idx threading (special-cased)
+    "speaker":  {"SPOKEN_BY"},
+    "temporal": {"PRECEDES", "OVERLAPS", "DURING"},     # temporal backbone adjacency
+    "emotion":  {"EMOTION_SHIFT"},
+    "similar":  {"SIMILAR_TO", "DESCRIBES"},
+    "contains": {"CONTAINS"},
 }
 
 VALID_RELATIONS = tuple(RELATION_EDGE_TYPES.keys())
@@ -55,7 +55,7 @@ def expand(
     working subgraph small enough for the answerer to read while still following
     the highest-signal edges first.
     """
-    rel = relation.upper().strip()
+    rel = relation.lower().strip()
     edge_types = RELATION_EDGE_TYPES.get(rel)
     if not edge_types:
         return set(), []
@@ -78,9 +78,9 @@ def expand(
             if e.relation_type in edge_types:
                 candidates.append((e.source_id, e))
 
-        # ENTITY: also thread through the global entity index — a character's
+        # entity: also thread through the global entity index — a character's
         # appearances are linked by shared entity_id rather than dense edges.
-        if rel == "ENTITY" and node.entity_id:
+        if rel == "entity" and node.entity_id:
             for aid in graph.entity_idx.get(node.entity_id, []):
                 if aid != nid and aid in graph.nodes:
                     synth = VKGEdge(

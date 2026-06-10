@@ -665,9 +665,9 @@ def _forced_action(state: WalkState, graph: VKGraph) -> Dict[str, Any]:
     if "causal_edge" in slots:
         return {"action": "BUILD"}
     if "temporal_occurrences" in slots:
-        return {"action": "EXPAND", "relation": "ENTITY"}
+        return {"action": "EXPAND", "relation": "entity"}
     if "episode_summary" in slots:
-        return {"action": "EXPAND", "relation": "CONTAINS"}
+        return {"action": "EXPAND", "relation": "contains"}
     if "entity_or_frame" in slots:
         return {"action": "BUILD"}
     return {"action": "RECALL", "query": state.question}
