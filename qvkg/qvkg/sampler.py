@@ -67,16 +67,38 @@ def _whisper_transcribe_worker(
     Tuned for throughput (§5): VAD skips silence, greedy (beam_size=1) decoding,
     int8_float16 compute, and condition_on_previous_text=False to avoid
     drift-induced re-decodes. The transcript feeds graph nodes, not a leaderboard."""
+    import subprocess
+    import tempfile
+
     from faster_whisper import WhisperModel
     try:
         model = WhisperModel(model_size, device="cuda", compute_type=compute_type)
     except Exception:
         # Some GPUs/builds reject int8_float16 — fall back to float16.
         model = WhisperModel(model_size, device="cuda", compute_type="float16")
-    segments, _ = model.transcribe(
-        video_path,
-        word_timestamps=True,
-        vad_filter=True,
+
+    # Decode audio with ffmpeg up front: odd containers/codecs make
+    # faster-whisper's internal decode crash (e.g. "tuple index out of range"),
+    # and a video without an audio stream should mean "no speech", not a crash.
+    audio_path = video_path
+    tmp_wav = None
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=codec_type", "-of", "csv=p=0", video_path],
+        capture_output=True, text=True)
+    if "audio" not in probe.stdout:
+        return []
+    try:
+        tmp_wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-i", video_path,
+             "-vn", "-ac", "1", "-ar", "16000", "-f", "wav", tmp_wav],
+            check=True, capture_output=True)
+        audio_path = tmp_wav
+    except Exception:
+        audio_path = video_path  # fall back to in-library decoding
+
+    common = dict(
         beam_size=1,
         condition_on_previous_text=False,
         # Proper-noun vocabulary hint (names from question metadata / OCR):
@@ -84,9 +106,31 @@ def _whisper_transcribe_worker(
         # depends on getting them right.
         initial_prompt=initial_prompt,
     )
-    result = list(segments)
-    del model
-    return result
+    # Degrade features instead of failing the whole build: word timestamps
+    # and VAD are each known crash sources on unusual audio.
+    attempts = [
+        dict(word_timestamps=True, vad_filter=True, **common),
+        dict(word_timestamps=False, vad_filter=True, **common),
+        dict(word_timestamps=False, vad_filter=False, beam_size=1,
+             condition_on_previous_text=False),
+    ]
+    last_exc = None
+    try:
+        for kw in attempts:
+            try:
+                segments, _ = model.transcribe(audio_path, **kw)
+                return list(segments)
+            except Exception as e:
+                last_exc = e
+                print(f"  [whisper] transcribe failed ({e}) — retrying degraded")
+        raise last_exc
+    finally:
+        del model
+        if tmp_wav:
+            try:
+                os.remove(tmp_wav)
+            except OSError:
+                pass
 
 
 class HierarchicalSampler:

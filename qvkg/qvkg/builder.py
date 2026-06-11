@@ -181,7 +181,12 @@ class VKGBuilder:
                         _write_checkpoint(output_dir, "step2_transcribed")
                         print(f"  Transcribed {len(speech_nodes)} speech segments")
                 except Exception as e:
-                    print(f"  Whisper failed: {e} — skipping audio")
+                    # A graph without speech answers dialogue questions blind —
+                    # leave a marker so campaigns can detect and repair it.
+                    print(f"  *** WHISPER FAILED: {e} — graph will have NO "
+                          f"speech evidence (marker: WHISPER_FAILED) ***")
+                    with open(os.path.join(output_dir, "WHISPER_FAILED"), "w") as mf:
+                        mf.write(str(e) + "\n")
 
             # Step 2b: Subtitle-track ingestion
             subtitle_nodes = _read_pickle(output_dir, "subtitle_nodes.pkl")
